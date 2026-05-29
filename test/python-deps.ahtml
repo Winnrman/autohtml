@@ -1,0 +1,27 @@
+<deps>
+  cowsay
+</deps>
+
+<server lang="python">
+import cowsay
+
+@app.get('/api/say')
+def say(req, res):
+    text = req.query.get('text', 'hello from python')
+    res.json({'art': cowsay.get_output_string('cow', text)})
+</server>
+
+<client>
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>cowsay</title></head>
+<body>
+  <pre id="out">loading...</pre>
+  <script>
+    fetch('/api/say?text=ahtml+speaks+python')
+      .then(r => r.json())
+      .then(d => document.getElementById('out').textContent = d.art);
+  </script>
+</body>
+</html>
+</client>

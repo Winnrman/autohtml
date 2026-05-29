@@ -60,6 +60,83 @@ const noClient = parse(`<server lang="node">app.get('/', () => {});</server>`)
 const errNoClient = validate(noClient)
 assert('missing client caught', errNoClient.some(e => e.includes('client')))
 
+// Validate: db type
+const badDb = parse(`<server lang="node">x;</server><client>y</client><db type="postgres">CREATE TABLE t(id INT);</db>`)
+const errBadDb = validate(badDb)
+assert('unsupported db type caught', errBadDb.some(e => e.includes('postgres')))
+
+const goodDb = parse(`<server lang="node">x;</server><client>y</client><db type="sqlite">CREATE TABLE t(id INT);</db>`)
+const errGoodDb = validate(goodDb)
+assert('sqlite db type passes', errGoodDb.length === 0)
+
+// Validate: port range
+const badPort = parse(`<server lang="node" port="99999">x;</server><client>y</client>`)
+const errBadPort = validate(badPort)
+assert('out-of-range port caught', errBadPort.some(e => e.includes('99999')))
+
+const privPort = parse(`<server lang="node" port="80">x;</server><client>y</client>`)
+const errPrivPort = validate(privPort)
+assert('privileged port caught', errPrivPort.some(e => e.includes('80')))
+
+const goodPort = parse(`<server lang="node" port="3000">x;</server><client>y</client>`)
+const errGoodPort = validate(goodPort)
+assert('valid port passes', errGoodPort.length === 0)
+
+// Python server lang
+console.log('\n── python backend tests ──\n')
+const pySrc = `
+<server lang="python">
+@app.get('/api/hi')
+def hi(req, res):
+    res.json({'hi': True})
+</server>
+<client><h1>py</h1></client>
+`
+const py = parse(pySrc)
+assert('python server lang parsed', py.meta.serverLang === 'python')
+assert('python server content kept', py.server.includes("@app.get('/api/hi')"))
+assert('python lang validates', validate(py).length === 0)
+
+// deps block
+const depsSrc = pySrc + `<deps>\nrequests\nflask==3.0.0\n# a comment\n\n</deps>`
+const pd = parse(depsSrc)
+assert('deps block parsed to array', Array.isArray(pd.deps))
+assert('deps has two entries', pd.deps.length === 2)
+assert('deps keeps version pin', pd.deps.includes('flask==3.0.0'))
+assert('deps skips comments/blanks', !pd.deps.some(d => d.startsWith('#') || d === ''))
+
+const noDeps = parse(pySrc)
+assert('no deps block → null', noDeps.deps === null)
+
+// real python file
+const pyFileSrc = fs.readFileSync(path.join(__dirname, 'python-notes.ahtml'), 'utf8')
+const pyFile = parse(pyFileSrc)
+assert('python-notes.ahtml parses', pyFile.server && pyFile.client)
+assert('python-notes.ahtml validates', validate(pyFile).length === 0)
+assert('python-notes.ahtml is python', pyFile.meta.serverLang === 'python')
+assert('python-notes.ahtml has db', pyFile.db !== null)
+
+// toPermPath: Windows extended-length prefix
+console.log('\n── toPermPath tests ──\n')
+// Inline the logic here so we can test it without spawning a child
+function toPermPath(p) {
+  const nodePath = require('path')
+  const abs = nodePath.resolve(p)
+  if (process.platform === 'win32' && !abs.startsWith('\\\\')) {
+    return '\\\\?\\' + abs
+  }
+  return abs
+}
+if (process.platform === 'win32') {
+  const result = toPermPath('C:\\Users\\hackr\\AppData\\Local\\Temp\\ahtml-server-123.js')
+  assert('toPermPath adds \\\\?\\ prefix on Windows', result.startsWith('\\\\?\\'))
+  const alreadyUNC = toPermPath('\\\\?\\C:\\already\\prefixed.js')
+  assert('toPermPath does not double-prefix', alreadyUNC.startsWith('\\\\?\\') && !alreadyUNC.startsWith('\\\\?\\\\\\?\\'))
+} else {
+  const result = toPermPath('/tmp/ahtml-server-123.js')
+  assert('toPermPath no-ops on non-Windows', !result.startsWith('\\\\?\\'))
+}
+
 // Real file
 console.log('\n── todo.ahtml parse test ──\n')
 const todoSrc = fs.readFileSync(path.join(__dirname, 'todo.ahtml'), 'utf8')

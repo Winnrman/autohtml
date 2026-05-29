@@ -1,0 +1,507 @@
+<db type="sqlite">
+CREATE TABLE IF NOT EXISTS embeddings_cache (
+  filepath TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  snippet TEXT NOT NULL DEFAULT '',
+  mtime REAL NOT NULL DEFAULT 0,
+  embedding BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
+);
+</db>
+
+<deps>
+sentence-transformers
+numpy
+</deps>
+
+<server lang="python">
+import os
+import sys
+import json
+import struct
+import threading
+import time
+import glob
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# ── Config ────────────────────────────────────────────────────────────────────
+DEFAULT_VAULT_PATHS = [
+    r'G:\My Drive\Vault Notes',
+    os.path.expanduser('~/Documents/Main Vault'),
+    os.path.expanduser('~/Documents/Vault Notes'),
+    os.path.expanduser('~/Documents/Notes'),
+]
+
+def find_vault_dir():
+    env = os.environ.get('VAULT_DIR', '').strip()
+    if env and os.path.isdir(env):
+        return env
+    for p in DEFAULT_VAULT_PATHS:
+        if os.path.isdir(p):
+            return p
+    return None
+
+VAULT_DIR = find_vault_dir()
+
+# ── Embedding helpers ─────────────────────────────────────────────────────────
+def vec_to_blob(vec):
+    return struct.pack(f'{len(vec)}f', *vec)
+
+def blob_to_vec(blob):
+    n = len(blob) // 4
+    return np.array(struct.unpack(f'{n}f', blob), dtype=np.float32)
+
+def cosine_sim(a, b):
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+# ── Markdown reading ──────────────────────────────────────────────────────────
+def read_md_files(vault_dir):
+    notes = []
+    pattern = os.path.join(vault_dir, '**', '*.md')
+    paths = glob.glob(pattern, recursive=True)
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            # Strip YAML frontmatter
+            body = content
+            if content.startswith('---'):
+                end = content.find('---', 3)
+                if end != -1:
+                    body = content[end+3:].strip()
+            title = os.path.splitext(os.path.basename(path))[0]
+            rel = os.path.relpath(path, vault_dir)
+            notes.append({
+                'filepath': rel,
+                'title': title,
+                'content': body,
+                'mtime': mtime,
+            })
+        except Exception:
+            continue
+    return notes
+
+# ── Global state ──────────────────────────────────────────────────────────────
+_model = None
+_model_lock = threading.Lock()
+_index_lock = threading.Lock()
+_status = {'state': 'idle', 'message': 'Not started', 'indexed': 0, 'total': 0}
+
+def get_model():
+    global _model
+    with _model_lock:
+        if _model is None:
+            _status['state'] = 'loading_model'
+            _status['message'] = 'Loading embedding model…'
+            _model = SentenceTransformer('all-MiniLM-L6-v2')
+        return _model
+
+def build_index_bg():
+    global _status
+    with _index_lock:
+        if not VAULT_DIR:
+            _status = {
+                'state': 'error',
+                'message': 'Vault folder not found. Set VAULT_DIR env var.',
+                'indexed': 0, 'total': 0
+            }
+            return
+
+        _status = {'state': 'reading', 'message': 'Reading markdown files…', 'indexed': 0, 'total': 0}
+        notes = read_md_files(VAULT_DIR)
+
+        if not notes:
+            _status = {'state': 'error', 'message': f'No .md files found in {VAULT_DIR}', 'indexed': 0, 'total': 0}
+            return
+
+        model = get_model()
+        _status['state'] = 'indexing'
+        _status['total'] = len(notes)
+        _status['message'] = f'Indexing {len(notes)} notes…'
+
+        needs_embed = []
+        for note in notes:
+            cached = db.get(
+                'SELECT mtime FROM embeddings_cache WHERE filepath = ?',
+                [note['filepath']]
+            )
+            if not cached or abs(cached['mtime'] - note['mtime']) > 0.01:
+                needs_embed.append(note)
+
+        already_done = len(notes) - len(needs_embed)
+        _status['indexed'] = already_done
+
+        batch_size = 32
+        for i in range(0, len(needs_embed), batch_size):
+            batch = needs_embed[i:i+batch_size]
+            texts = [
+                f"{n['title']}\n\n{n['content'][:1200]}"
+                for n in batch
+            ]
+            embeddings = model.encode(texts, normalize_embeddings=True)
+            for note, emb in zip(batch, embeddings):
+                snippet = note['content'][:220].replace('\n', ' ').strip()
+                db.run(
+                    '''INSERT OR REPLACE INTO embeddings_cache
+                       (filepath, title, snippet, mtime, embedding)
+                       VALUES (?, ?, ?, ?, ?)''',
+                    [note['filepath'], note['title'], snippet,
+                     note['mtime'], vec_to_blob(emb)]
+                )
+            _status['indexed'] = already_done + i + len(batch)
+            _status['message'] = f"Indexed {_status['indexed']} / {_status['total']} notes…"
+
+        # Remove cached entries for deleted files
+        cached_paths = {r['filepath'] for r in db.query('SELECT filepath FROM embeddings_cache', [])}
+        live_paths = {n['filepath'] for n in notes}
+        for stale in cached_paths - live_paths:
+            db.run('DELETE FROM embeddings_cache WHERE filepath = ?', [stale])
+
+        db.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_index', ?)",
+               [str(int(time.time()))])
+        _status = {
+            'state': 'ready',
+            'message': f'Ready — {len(notes)} notes indexed',
+            'indexed': len(notes),
+            'total': len(notes)
+        }
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get('/api/status')
+def get_status(req, res):
+    res.json({**_status, 'vault_dir': VAULT_DIR or 'Not found'})
+
+
+@app.post('/api/index')
+def post_index(req, res):
+    if _status['state'] in ('loading_model', 'reading', 'indexing'):
+        res.json({'ok': False, 'message': 'Already indexing'})
+        return
+    t = threading.Thread(target=build_index_bg, daemon=True)
+    t.start()
+    res.json({'ok': True})
+
+
+@app.post('/api/search')
+def post_search(req, res):
+    if _status['state'] != 'ready':
+        res.status(503).json({'error': 'Index not ready', 'state': _status['state']})
+        return
+
+    query = (req.body or {}).get('query', '').strip()
+    top_k = int((req.body or {}).get('top_k', 12))
+    if not query:
+        res.status(400).json({'error': 'query required'})
+        return
+
+    model = get_model()
+    q_emb = model.encode([query], normalize_embeddings=True)[0]
+
+    rows = db.query('SELECT filepath, title, snippet, embedding FROM embeddings_cache', [])
+    if not rows:
+        res.json([])
+        return
+
+    scored = []
+    for row in rows:
+        emb = blob_to_vec(row['embedding'])
+        score = cosine_sim(q_emb, emb)
+        scored.append({
+            'filepath': row['filepath'],
+            'title': row['title'],
+            'snippet': row['snippet'],
+            'score': round(score, 4)
+        })
+
+    scored.sort(key=lambda x: x['score'], reverse=True)
+    res.json(scored[:top_k])
+
+
+# Auto-start on boot
+threading.Thread(target=build_index_bg, daemon=True).start()
+</server>
+
+<client>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vault Search</title>
+</head>
+<body>
+
+  <header>
+    <span class="logo">✦ Vault Search</span>
+    <div class="header-right">
+      <div id="status-pill" class="status-pill status--loading">
+        <span class="status-dot"></span>
+        <span id="status-text">Starting…</span>
+      </div>
+      <button class="btn-ghost reindex-btn" id="reindex-btn" onclick="reindex()" title="Re-scan vault">↺ Reindex</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="search-hero">
+      <div class="search-tagline">Semantic search across your notes.</div>
+      <div class="search-bar-wrap">
+        <input
+          type="text"
+          id="query-input"
+          class="search-bar"
+          placeholder="What were my thoughts on consciousness?"
+          autofocus
+          onkeydown="if(event.key==='Enter')doSearch()"
+          disabled
+        />
+        <button class="btn search-btn" id="search-btn" onclick="doSearch()" disabled>Search</button>
+      </div>
+      <div id="search-hint" class="search-hint">Starting up…</div>
+    </div>
+
+    <div id="vault-error" class="vault-error hidden"></div>
+
+    <div id="results-wrap" class="hidden">
+      <div class="results-meta" id="results-meta"></div>
+      <div id="results-list"></div>
+    </div>
+  </main>
+
+  <script>
+    function esc(str) {
+      return String(str || '')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function api(method, path, body) {
+      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+      if (body) opts.body = JSON.stringify(body);
+      const r = await fetch(path, opts);
+      return r.json();
+    }
+
+    // ── Status polling ────────────────────────────────────────────────────────
+    let pollTimer = null;
+
+    function setStatusPill(state, message) {
+      const pill = document.getElementById('status-pill');
+      pill.className = 'status-pill status--' + (state === 'ready' ? 'ready' : state === 'error' ? 'error' : 'loading');
+      document.getElementById('status-text').textContent = message;
+    }
+
+    function setSearchEnabled(on) {
+      document.getElementById('query-input').disabled = !on;
+      document.getElementById('search-btn').disabled = !on;
+    }
+
+    async function pollStatus() {
+      try {
+        const s = await api('GET', '/api/status');
+
+        if (s.state === 'error') {
+          setStatusPill('error', s.message);
+          setSearchEnabled(false);
+          const errEl = document.getElementById('vault-error');
+          errEl.innerHTML = `
+            <strong>Could not find vault folder.</strong><br>${esc(s.message)}<br><br>
+            Run with: <code>set VAULT_DIR=G:\\My Drive\\Vault Notes</code> then start again,
+            or move your notes to <code>~/Documents/Vault Notes</code>.
+          `;
+          errEl.classList.remove('hidden');
+          document.getElementById('search-hint').textContent = '';
+          clearInterval(pollTimer);
+          return;
+        }
+
+        if (s.state === 'ready') {
+          setStatusPill('ready', `${s.indexed} notes indexed`);
+          setSearchEnabled(true);
+          document.getElementById('search-hint').textContent =
+            `${s.indexed} notes ready · ${s.vault_dir}`;
+          clearInterval(pollTimer);
+          return;
+        }
+
+        const pct = s.total > 0 ? Math.round((s.indexed / s.total) * 100) : 0;
+        setStatusPill('loading', s.message || 'Indexing…');
+        document.getElementById('search-hint').textContent =
+          s.total > 0
+            ? `Indexing ${s.indexed} / ${s.total} notes (${pct}%)…`
+            : (s.message || 'Starting…');
+
+      } catch(e) { /* server not up yet */ }
+    }
+
+    pollTimer = setInterval(pollStatus, 1000);
+    pollStatus();
+
+    // ── Reindex ───────────────────────────────────────────────────────────────
+    async function reindex() {
+      const btn = document.getElementById('reindex-btn');
+      btn.disabled = true;
+      setSearchEnabled(false);
+      await api('POST', '/api/index', {});
+      pollTimer = setInterval(pollStatus, 1000);
+      pollStatus();
+      setTimeout(() => { btn.disabled = false; }, 3000);
+    }
+
+    // ── Search ────────────────────────────────────────────────────────────────
+    async function doSearch() {
+      const query = document.getElementById('query-input').value.trim();
+      if (!query) return;
+
+      const btn = document.getElementById('search-btn');
+      btn.disabled = true;
+      btn.textContent = '…';
+      document.getElementById('results-wrap').classList.remove('hidden');
+      document.getElementById('results-list').innerHTML = '<div class="searching">Searching…</div>';
+      document.getElementById('results-meta').textContent = '';
+
+      try {
+        const results = await api('POST', '/api/search', { query, top_k: 12 });
+        if (results.error) {
+          document.getElementById('results-list').innerHTML = `<div class="search-err">${esc(results.error)}</div>`;
+        } else {
+          renderResults(results, query);
+        }
+      } catch(e) {
+        document.getElementById('results-list').innerHTML = '<div class="search-err">Search failed.</div>';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Search';
+      }
+    }
+
+    function renderResults(results, query) {
+      document.getElementById('results-meta').textContent =
+        results.length ? `${results.length} results for "${query}"` : '';
+
+      if (!results.length) {
+        document.getElementById('results-list').innerHTML = '<div class="no-results">No results found.</div>';
+        return;
+      }
+
+      document.getElementById('results-list').innerHTML = results.map((r, i) => {
+        const pct = Math.round(r.score * 100);
+        const scoreClass = pct >= 60 ? 'score--high' : pct >= 35 ? 'score--mid' : 'score--low';
+        const folder = r.filepath.includes('\\') || r.filepath.includes('/')
+          ? r.filepath.replace(/[/\\][^/\\]+$/, '')
+          : '';
+        return `
+          <div class="result-card" style="animation-delay:${i*25}ms">
+            <div class="result-header">
+              <div class="result-title-wrap">
+                <span class="result-title">${esc(r.title || 'Untitled')}</span>
+                ${folder ? `<span class="result-folder">${esc(folder)}</span>` : ''}
+              </div>
+              <span class="score-badge ${scoreClass}">${pct}%</span>
+            </div>
+            ${r.snippet ? `<div class="result-snippet">${esc(r.snippet)}</div>` : ''}
+            <div class="score-bar-wrap"><div class="score-bar" style="width:${Math.max(3,pct)}%"></div></div>
+          </div>`;
+      }).join('');
+    }
+  </script>
+</body>
+</html>
+</client>
+
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, 'Inter', sans-serif; background: #faf9f6; color: #1a1a1a; min-height: 100vh; }
+
+header {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 28px; background: rgba(250,249,246,0.92);
+  backdrop-filter: blur(8px); border-bottom: 1px solid #eee;
+}
+.logo { font-weight: 700; font-size: 1rem; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+
+.status-pill {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 500;
+  border: 1.5px solid transparent; transition: all 0.3s;
+}
+.status--loading { background: #fef9ec; border-color: #f5d86a; color: #92640a; }
+.status--ready   { background: #e8f0ed; border-color: #a3c9bc; color: #0f6e56; }
+.status--error   { background: #fef2f2; border-color: #fca5a5; color: #dc2626; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.status--loading .status-dot { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+.reindex-btn { font-size: 0.8rem; padding: 5px 12px; }
+
+main { padding: 0 28px 48px; max-width: 760px; margin: 0 auto; }
+
+.search-hero { padding: 64px 0 36px; }
+.search-tagline { font-size: 1.5rem; font-weight: 700; margin-bottom: 20px; }
+.search-bar-wrap { display: flex; gap: 10px; margin-bottom: 12px; }
+.search-bar {
+  flex: 1; padding: 14px 18px; font-size: 1rem;
+  border: 2px solid #ddd; border-radius: 12px;
+  font-family: inherit; outline: none; background: white; transition: border-color 0.15s;
+}
+.search-bar:focus { border-color: #0f6e56; }
+.search-bar:disabled { background: #f5f5f5; color: #aaa; }
+.search-btn { padding: 14px 24px; font-size: 1rem; border-radius: 12px; }
+.search-hint { font-size: 0.82rem; color: #aaa; }
+
+.vault-error {
+  padding: 18px 22px; background: #fef2f2; border: 1.5px solid #fca5a5;
+  border-radius: 12px; font-size: 0.88rem; line-height: 1.75; color: #7f1d1d; margin-bottom: 24px;
+}
+.vault-error.hidden { display: none; }
+.vault-error code { background: #fee2e2; padding: 2px 6px; border-radius: 4px; font-size: 0.82rem; }
+
+.hidden { display: none; }
+.results-meta { font-size: 0.82rem; color: #999; margin-bottom: 14px; }
+.searching, .no-results, .search-err { padding: 32px; text-align: center; color: #bbb; font-size: 0.92rem; }
+.search-err { color: #dc2626; }
+
+.result-card {
+  padding: 15px 18px; background: white; border: 1.5px solid #eee;
+  border-radius: 12px; margin-bottom: 10px;
+  animation: fadeUp 0.2s ease both; transition: border-color 0.12s;
+}
+.result-card:hover { border-color: #c5ddd6; }
+@keyframes fadeUp { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+
+.result-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.result-title-wrap { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.result-title { font-weight: 600; font-size: 0.95rem; }
+.result-folder { font-size: 0.75rem; color: #bbb; }
+.result-snippet {
+  font-size: 0.83rem; color: #777; line-height: 1.5; margin-bottom: 10px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.score-badge { font-size: 0.72rem; font-weight: 700; border-radius: 6px; padding: 3px 8px; white-space: nowrap; flex-shrink: 0; }
+.score--high { background: #e8f0ed; color: #0f6e56; }
+.score--mid  { background: #fef9ec; color: #92640a; }
+.score--low  { background: #f5f5f5; color: #aaa; }
+.score-bar-wrap { height: 3px; background: #f0ede8; border-radius: 2px; overflow: hidden; }
+.score-bar { height: 100%; background: #0f6e56; border-radius: 2px; }
+
+.btn { display: inline-block; padding: 10px 20px; background: #0f6e56; color: white; border: none; border-radius: 8px; font-size: 0.95rem; cursor: pointer; font-family: inherit; }
+.btn:hover:not(:disabled) { background: #085041; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-ghost { display: inline-block; padding: 9px 16px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.88rem; color: #666; background: white; cursor: pointer; font-family: inherit; }
+.btn-ghost:hover:not(:disabled) { border-color: #aaa; }
+.btn-ghost:disabled { opacity: 0.45; cursor: not-allowed; }
+</style>

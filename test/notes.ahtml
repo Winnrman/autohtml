@@ -88,6 +88,9 @@ app.delete('/api/notes', (req, res) => {
       }
     }
 
+    console.log('nigga');
+
+
     function renderList() {
       const list = document.getElementById('note-list');
       list.innerHTML = notes.map(n => `

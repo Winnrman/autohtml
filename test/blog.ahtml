@@ -17,6 +17,10 @@
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '',
+    images TEXT NOT NULL DEFAULT '[]',
+    published INTEGER NOT NULL DEFAULT 1,
+    mood TEXT NOT NULL DEFAULT '{}',
     author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
@@ -24,6 +28,17 @@
 
 <server lang="node">
   const crypto = require('crypto');
+
+  // ── migrations ────────────────────────────────────────────────────────────
+  let _migrated = false;
+  function ensureCols() {
+    if (_migrated) return;
+    _migrated = true;
+    try { db.exec("ALTER TABLE posts ADD COLUMN tags TEXT NOT NULL DEFAULT ''"); } catch(e) {}
+    try { db.exec("ALTER TABLE posts ADD COLUMN images TEXT NOT NULL DEFAULT '[]'"); } catch(e) {}
+    try { db.exec("ALTER TABLE posts ADD COLUMN published INTEGER NOT NULL DEFAULT 1"); } catch(e) {}
+    try { db.exec("ALTER TABLE posts ADD COLUMN mood TEXT NOT NULL DEFAULT '{}'"); } catch(e) {}
+  }
 
   // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -135,30 +150,58 @@
   // ── post routes ──────────────────────────────────────────────────────────
 
   app.get('/api/posts', (req, res) => {
-    const posts = db.query(
-      'SELECT p.*, u.username as author FROM posts p JOIN users u ON u.id = p.author_id ORDER BY p.created_at DESC'
-    );
-    res.json(posts);
+    ensureCols();
+    const session = getSession(req);
+    const { tag, q } = req.query;
+    let sql = 'SELECT p.*, u.username as author FROM posts p JOIN users u ON u.id = p.author_id';
+    const params = [];
+    const wheres = [];
+    if (session) {
+      wheres.push('(p.published = 1 OR p.author_id = ?)');
+      params.push(session.user_id);
+    } else {
+      wheres.push('p.published = 1');
+    }
+    if (tag) {
+      wheres.push("(',' || COALESCE(p.tags,'') || ',' LIKE ?)");
+      params.push('%,' + tag + ',%');
+    }
+    if (q) {
+      wheres.push('(LOWER(p.title) LIKE ? OR LOWER(p.body) LIKE ?)');
+      params.push('%' + q.toLowerCase() + '%', '%' + q.toLowerCase() + '%');
+    }
+    if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
+    sql += ' ORDER BY p.created_at DESC';
+    res.json(db.query(sql, params));
   });
 
   app.get('/api/posts/:id', (req, res) => {
+    ensureCols();
+    const session = getSession(req);
     const id = req.url.split('/').pop().split('?')[0];
     const post = db.get(
       'SELECT p.*, u.username as author FROM posts p JOIN users u ON u.id = p.author_id WHERE p.id = ?',
       [id]
     );
-    if (!post) { res.status(404).json({ error: 'not found' }); return; }
+    if (!post || (post.published === 0 && (!session || session.user_id !== post.author_id))) {
+      res.status(404).json({ error: 'not found' }); return;
+    }
     res.json(post);
   });
 
   app.post('/api/posts', (req, res) => {
+    ensureCols();
     const session = requireAuth(req, res);
     if (!session) return;
-    const { title, body } = req.body;
+    const { title, body, tags, images, published, mood } = req.body;
     if (!title || !body) { res.status(400).json({ error: 'title and body required' }); return; }
+    const tagsStr = (tags || '').split(',').map(t => t.trim()).filter(Boolean).join(',');
+    const imagesStr = JSON.stringify(Array.isArray(images) ? images : []);
+    const pub = published === 0 ? 0 : 1;
+    const moodStr = JSON.stringify(mood && typeof mood === 'object' ? mood : {});
     const result = db.run(
-      'INSERT INTO posts (title, body, author_id) VALUES (?, ?, ?)',
-      [title, body, session.user_id]
+      'INSERT INTO posts (title, body, tags, images, published, mood, author_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [title, body, tagsStr, imagesStr, pub, moodStr, session.user_id]
     );
     res.json(db.get(
       'SELECT p.*, u.username as author FROM posts p JOIN users u ON u.id = p.author_id WHERE p.id = ?',
@@ -166,7 +209,32 @@
     ));
   });
 
+  app.put('/api/posts', (req, res) => {
+    ensureCols();
+    const session = requireAuth(req, res);
+    if (!session) return;
+    const { id, title, body, tags, images, published, mood } = req.body;
+    if (!id || !title || !body) { res.status(400).json({ error: 'id, title and body required' }); return; }
+    const post = db.get('SELECT * FROM posts WHERE id = ?', [id]);
+    if (!post) { res.status(404).json({ error: 'not found' }); return; }
+    if (post.author_id !== session.user_id) {
+      res.status(403).json({ error: 'you can only edit your own posts' });
+      return;
+    }
+    const tagsStr = (tags || '').split(',').map(t => t.trim()).filter(Boolean).join(',');
+    const imagesStr = JSON.stringify(Array.isArray(images) ? images : []);
+    const pub = published === 0 ? 0 : 1;
+    const moodStr = JSON.stringify(mood && typeof mood === 'object' ? mood : {});
+    db.run('UPDATE posts SET title = ?, body = ?, tags = ?, images = ?, published = ?, mood = ? WHERE id = ?',
+      [title, body, tagsStr, imagesStr, pub, moodStr, id]);
+    res.json(db.get(
+      'SELECT p.*, u.username as author FROM posts p JOIN users u ON u.id = p.author_id WHERE p.id = ?',
+      [id]
+    ));
+  });
+
   app.delete('/api/posts', (req, res) => {
+    ensureCols();
     const session = requireAuth(req, res);
     if (!session) return;
     const post = db.get('SELECT * FROM posts WHERE id = ?', [req.body.id]);
@@ -191,21 +259,447 @@
 <body>
   <header>
     <a href="/" class="logo">✦ blog</a>
+    <div class="header-search-wrap">
+      <input type="search" id="header-search" placeholder="Search posts…" oninput="headerSearch(this.value)" autocomplete="off">
+    </div>
     <nav id="nav"></nav>
   </header>
 
   <main id="app"></main>
 
   <script>
-    // ── auth state ───────────────────────────────────────────────────────────
-    let currentUser = null;
+    // ── state ────────────────────────────────────────────────────────────────
+    let currentUser   = null;
+    let allPosts      = [];
+    let activeTag     = null;
+    let searchQuery   = '';
+    let formImages    = [];
+    let formPublished = true;
+    let _userReady    = null;
+    let viewMode      = 'grid';
+    let quickViewId   = null;
 
+    // ── utils ────────────────────────────────────────────────────────────────
+    function esc(str) {
+      return String(str)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+    function fmt(dt) {
+      return new Date(dt).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });
+    }
+    function parseImages(raw) {
+      try { return JSON.parse(raw || '[]'); } catch(e) { return []; }
+    }
+    // pull [img:URL] out of old-format bodies for backward compat
+    function extractBodyImages(body) {
+      const imgs = [], re = /\[img:([^\]]+)\]/g;
+      let m;
+      while ((m = re.exec(body)) !== null) imgs.push(m[1].trim());
+      return imgs;
+    }
+    function getAllImages(post) {
+      return [...parseImages(post.images), ...extractBodyImages(post.body || '')];
+    }
+
+    // ── inline formatter (markdown + backlinks) ───────────────────────────────
+    function inlineFormat(text, posts) {
+      const tokens = [];
+      const ph = html => { const id = '\x01' + tokens.length + '\x01'; tokens.push(html); return id; };
+      let s = text;
+      // code spans first — content is escaped and protected
+      s = s.replace(/`([^`]+)`/g, (_, c) => ph('<code class="md-code">' + esc(c) + '</code>'));
+      // [[backlinks]]
+      if (posts && posts.length) {
+        s = s.replace(/\[\[([^\]]+)\]\]/g, (_, title) => {
+          const found = posts.find(p => p.title.toLowerCase() === title.toLowerCase());
+          return found
+            ? ph('<a href="/post/' + found.id + '" class="backlink">[[' + esc(title) + ']]</a>')
+            : ph('<span class="backlink-missing">[[' + esc(title) + ']]</span>');
+        });
+      }
+      // markdown links [label](url)
+      s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (_, label, url) =>
+        ph('<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>'));
+      // bare https:// URLs
+      s = s.replace(/(https?:\/\/\S+)/g, url =>
+        ph('<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(url) + '</a>'));
+      // escape remaining text
+      s = esc(s);
+      // bold **text** (before italic)
+      s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+      // italic *text*
+      s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+      return s.replace(/\x01(\d+)\x01/g, (_, i) => tokens[+i]);
+    }
+
+    // ── body renderer: markdown ───────────────────────────────────────────────
+    function renderBody(rawText, posts) {
+      const text = (rawText || '').replace(/\[img:[^\]]*\]/g, '').trim();
+      if (!text) return '';
+      const lines = text.split('\n');
+      const out = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        // headings # ## ###
+        const hm = line.match(/^(#{1,3})\s+(.*)/);
+        if (hm) {
+          const n = hm[1].length;
+          out.push('<h' + n + ' class="md-h">' + inlineFormat(hm[2], posts) + '</h' + n + '>');
+          i++; continue;
+        }
+        // horizontal rule ---
+        if (/^---+\s*$/.test(line)) { out.push('<hr class="md-hr">'); i++; continue; }
+        // blockquote: collect consecutive > lines
+        if (line.startsWith('>')) {
+          const qLines = [];
+          while (i < lines.length && lines[i].startsWith('>')) {
+            qLines.push(inlineFormat(lines[i].replace(/^>\s?/, ''), posts));
+            i++;
+          }
+          out.push('<blockquote class="md-bq">' + qLines.join('<br>') + '</blockquote>');
+          continue;
+        }
+        // blank line
+        if (!line.trim()) { i++; continue; }
+        // paragraph: collect until blank or block element
+        const pLines = [];
+        while (i < lines.length) {
+          const l = lines[i];
+          if (!l.trim() || /^#{1,3}\s/.test(l) || l.startsWith('>') || /^---+\s*$/.test(l)) break;
+          pLines.push(inlineFormat(l, posts));
+          i++;
+        }
+        if (pLines.length) out.push('<p class="md-p">' + pLines.join('<br>') + '</p>');
+      }
+      return '<div class="body-md">' + out.join('') + '</div>';
+    }
+
+    function stripMd(text) {
+      return (text || '')
+        .replace(/\[img:[^\]]*\]/g, '')
+        .replace(/^#{1,3}\s+/gm, '')
+        .replace(/^>\s?/gm, '')
+        .replace(/^---+\s*$/gm, '')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\[\[([^\]]+)\]\]/g, '$1')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+    }
+
+    function readingTime(text) {
+      const words = stripMd(text).trim().split(/\s+/).filter(Boolean).length;
+      const mins = Math.max(1, Math.round(words / 200));
+      return mins === 1 ? '1 min read' : mins + ' min read';
+    }
+
+    function bodyPreview(post) {
+      const plain = stripMd(post.body || '').replace(/\s+/g, ' ').trim();
+      return esc(plain).slice(0, 140) + (plain.length > 140 ? '…' : '');
+    }
+
+    // ── mood helpers ─────────────────────────────────────────────────────────
+    const MOOD_DEF = [
+      { key: 'vibe',  lo: 'Calm',    hi: 'Energetic' },
+      { key: 'tone',  lo: 'Serious', hi: 'Playful' },
+      { key: 'depth', lo: 'Surface', hi: 'Deep' },
+    ];
+    function parseMood(raw) { try { return JSON.parse(raw || '{}'); } catch(e) { return {}; } }
+    function renderMood(moodRaw) {
+      const m = parseMood(moodRaw);
+      if (!Object.keys(m).length) return '';
+      return '<div class="mood-display">' +
+        MOOD_DEF.map(s => {
+          const val = m[s.key] !== undefined ? m[s.key] : 50;
+          return '<div class="mood-disp-row">' +
+            '<span class="mood-disp-lo">' + esc(s.lo) + '</span>' +
+            '<div class="mood-track"><div class="mood-fill" style="width:' + val + '%"></div></div>' +
+            '<span class="mood-disp-hi">' + esc(s.hi) + '</span>' +
+          '</div>';
+        }).join('') +
+      '</div>';
+    }
+    function renderMoodSliders(m) {
+      return MOOD_DEF.map(s => `
+        <div class="mood-slider-row">
+          <span class="mood-slider-label">${esc(s.key.charAt(0).toUpperCase() + s.key.slice(1))}</span>
+          <span class="mood-side">${esc(s.lo)}</span>
+          <input type="range" id="m-${s.key}" min="0" max="100" value="${m[s.key] !== undefined ? m[s.key] : 50}" class="mood-range">
+          <span class="mood-side">${esc(s.hi)}</span>
+        </div>`).join('');
+    }
+
+    // ── home page helpers ─────────────────────────────────────────────────────
+    function getAllTags() {
+      return [...new Set(allPosts.flatMap(p =>
+        (p.tags || '').split(',').map(t => t.trim()).filter(Boolean)
+      ))].sort();
+    }
+    function getFilteredPosts() {
+      let posts = allPosts;
+      if (activeTag) {
+        posts = posts.filter(p =>
+          (p.tags || '').split(',').map(t => t.trim()).includes(activeTag)
+        );
+      }
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        posts = posts.filter(p =>
+          p.title.toLowerCase().includes(q) || p.body.toLowerCase().includes(q)
+        );
+      }
+      return posts;
+    }
+    function renderTagChips(tags) {
+      return `<button class="tag-chip${!activeTag ? ' active' : ''}" onclick="setTag(null)">All</button>`
+        + tags.map(t => `<button class="tag-chip${activeTag === t ? ' active' : ''}" onclick="setTag('${esc(t)}')">${esc(t)}</button>`).join('');
+    }
+    function renderPostListHTML(posts) {
+      if (!posts.length) return `
+        <div class="empty">
+          <p>${activeTag || searchQuery ? 'No posts match your filter.' : 'No posts yet.'}</p>
+          ${!activeTag && !searchQuery
+            ? currentUser
+              ? `<a href="/new" class="btn">Write the first one</a>`
+              : `<a href="/register" class="btn">Sign up to write</a>`
+            : `<button class="btn-ghost" onclick="setTag(null);clearHeaderSearch()">Clear filter</button>`}
+        </div>`;
+      if (viewMode === 'list') {
+        return `<div class="post-list">${posts.map(p => {
+          const thumb = getAllImages(p)[0];
+          const bg = thumb ? 'background-image:url(' + esc(thumb) + ')' : '';
+          return `<article class="post-card" onclick="navigate('/post/${p.id}')">
+            ${thumb ? `<div class="post-thumb" style="${bg}"></div>` : ''}
+            <div class="post-card-body">
+              <div class="post-card-title">${esc(p.title)}</div>
+              <div class="post-card-preview">${bodyPreview(p)}</div>
+              <div class="post-card-meta">${p.published === 0 ? '<span class="draft-badge" style="font-size:0.6rem">Draft</span> ' : ''}@${esc(p.author)} · ${readingTime(p.body)}</div>
+            </div>
+            <button class="card-eye" onclick="event.stopPropagation();quickView(${p.id})" title="Quick view">👁</button>
+          </article>`;
+        }).join('')}</div>`;
+      }
+      return `<div class="post-grid">${posts.map(p => {
+        const thumb = getAllImages(p)[0];
+        const bg = thumb ? 'background-image:url(' + esc(thumb) + ')' : '';
+        return `<article class="post-tile${thumb ? ' has-img' : ''}" onclick="navigate('/post/${p.id}')">
+          <div class="tile-banner" style="${bg}">
+            <button class="tile-eye" onclick="event.stopPropagation();quickView(${p.id})" title="Quick view">👁</button>
+          </div>
+          <div class="tile-body">
+            <div class="tile-title">${esc(p.title)}</div>
+            <div class="tile-meta">${p.published === 0 ? '<span class="draft-badge" style="font-size:0.6rem">Draft</span> ' : ''}@${esc(p.author)} · ${readingTime(p.body)}</div>
+          </div>
+        </article>`;
+      }).join('')}</div>`;
+    }
+    function setTag(tag) {
+      activeTag = tag;
+      history.replaceState({}, '', activeTag ? '/?tag=' + encodeURIComponent(activeTag) : '/');
+      const btn = document.getElementById('tag-toggle-btn');
+      if (btn) btn.innerHTML = (activeTag ? esc(activeTag) : 'Tags') + ' <span class="tag-caret">▾</span>';
+      const dd = document.getElementById('tag-dropdown');
+      if (dd) { dd.innerHTML = renderTagChips(getAllTags()); dd.classList.add('hidden'); }
+      const pl = document.getElementById('post-list-container');
+      if (pl) pl.innerHTML = renderPostListHTML(getFilteredPosts());
+    }
+    function toggleTagDropdown() {
+      const dd = document.getElementById('tag-dropdown');
+      if (dd) dd.classList.toggle('hidden');
+    }
+    function updateSearch(q) {
+      searchQuery = q;
+      const pl = document.getElementById('post-list-container');
+      if (pl) pl.innerHTML = renderPostListHTML(getFilteredPosts());
+    }
+    function headerSearch(val) {
+      searchQuery = val;
+      if (window.location.pathname === '/') {
+        const pl = document.getElementById('post-list-container');
+        if (pl) { pl.innerHTML = renderPostListHTML(getFilteredPosts()); return; }
+      }
+      navigate('/' + (val ? '?q=' + encodeURIComponent(val) : ''));
+    }
+    function setView(mode) {
+      viewMode = mode;
+      document.querySelectorAll('.view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === mode));
+      const pl = document.getElementById('post-list-container');
+      if (pl) pl.innerHTML = renderPostListHTML(getFilteredPosts());
+    }
+
+    async function quickView(id) {
+      quickViewId = id;
+      const panel = document.getElementById('quick-panel');
+      if (!panel) return;
+      panel.classList.add('open');
+      panel.innerHTML = '<div class="qv-inner"><div class="qv-loading">Loading…</div></div>';
+      const [post, postsRes] = await Promise.all([
+        fetch('/api/posts/' + id).then(r => r.json()),
+        allPosts.length ? Promise.resolve(allPosts) : fetch('/api/posts').then(r => r.json()),
+      ]);
+      if (post.error) {
+        panel.innerHTML = '<div class="qv-inner"><p class="qv-loading">Post not found.</p></div>';
+        return;
+      }
+      const posts = Array.isArray(postsRes) ? postsRes : allPosts;
+      const images = getAllImages(post);
+      const bodyHtml = renderBody(post.body, posts);
+      const tags = (post.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+      panel.innerHTML = `
+        <div class="qv-inner">
+          <div class="qv-header">
+            <span class="qv-title">${esc(post.title)}</span>
+            <button class="qv-close" onclick="closeQuickView()" title="Close">×</button>
+          </div>
+          ${images[0] ? `<div class="qv-banner" style="background-image:url(${esc(images[0])})"></div>` : ''}
+          <div class="qv-meta">@${esc(post.author)} · ${fmt(post.created_at)} · ${readingTime(post.body)}</div>
+          ${tags.length ? `<div class="qv-tags">${tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
+          <div class="qv-content">${bodyHtml || '<p style="color:#bbb;text-align:center">No content.</p>'}</div>
+          <div class="qv-footer"><a href="/post/${post.id}" class="btn" style="font-size:0.82rem;padding:7px 16px">Read full post →</a></div>
+        </div>`;
+    }
+
+    function closeQuickView() {
+      quickViewId = null;
+      const panel = document.getElementById('quick-panel');
+      if (!panel) return;
+      panel.classList.remove('open');
+      setTimeout(() => { if (!panel.classList.contains('open')) panel.innerHTML = ''; }, 300);
+    }
+
+    function clearHeaderSearch() {
+      searchQuery = '';
+      activeTag = null;
+      const el = document.getElementById('header-search');
+      if (el) el.value = '';
+      const pl = document.getElementById('post-list-container');
+      if (pl) pl.innerHTML = renderPostListHTML(getFilteredPosts());
+    }
+
+    // ── image panel (editor) ─────────────────────────────────────────────────
+    function renderImagePanel() {
+      const el = document.getElementById('img-panel');
+      if (!el) return;
+      el.innerHTML = `
+        ${formImages.map((url, i) => `
+          <div class="img-item">
+            <img src="${esc(url)}" class="img-item-thumb" alt="" loading="lazy" onerror="this.parentElement.remove()">
+            <button class="img-item-remove" onclick="removeFormImage(${i})" title="Remove">×</button>
+          </div>`).join('')}
+        <div class="img-add-section">
+          <div class="img-add-row">
+            <input id="img-url-input" type="url" placeholder="Paste image URL…"
+                   oninput="previewImgUrl(this.value)"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();addImageFromUrl();}">
+            <button class="img-add-btn" onclick="addImageFromUrl()">Add</button>
+          </div>
+          <div id="img-url-preview" class="img-url-preview"></div>
+          <label class="img-upload-btn">
+            📁 Upload
+            <input type="file" accept="image/*" multiple style="display:none" onchange="handleImageUpload(this)">
+          </label>
+        </div>`;
+    }
+    function addImageFromUrl() {
+      const input = document.getElementById('img-url-input');
+      if (!input) return;
+      const url = input.value.trim();
+      if (!url) return;
+      formImages.push(url);
+      input.value = '';
+      const preview = document.getElementById('img-url-preview');
+      if (preview) preview.innerHTML = '';
+      renderImagePanel();
+    }
+    function removeFormImage(idx) {
+      formImages.splice(idx, 1);
+      renderImagePanel();
+    }
+    function previewImgUrl(url) {
+      const el = document.getElementById('img-url-preview');
+      if (!el) return;
+      el.innerHTML = url.trim()
+        ? `<img src="${esc(url.trim())}" loading="lazy" onerror="this.parentElement.innerHTML=''">`
+        : '';
+    }
+    function handleImageUpload(input) {
+      const files = Array.from(input.files);
+      if (!files.length) return;
+      let loaded = 0;
+      files.forEach(file => {
+        const reader = new FileReader();
+        reader.onload = e => {
+          formImages.push(e.target.result);
+          loaded++;
+          if (loaded === files.length) renderImagePanel();
+        };
+        reader.readAsDataURL(file);
+      });
+      input.value = '';
+    }
+
+    function updateFormTitle(val) {
+      const h1 = document.getElementById('form-title-heading');
+      if (!h1) return;
+      const editId = document.getElementById('post-form')?.dataset.editId;
+      h1.textContent = val.trim() || (editId ? 'Edit post' : 'New post');
+    }
+
+    // ── post form ─────────────────────────────────────────────────────────────
+    function renderPostForm(post) {
+      const isEdit = !!post;
+      formImages = post ? getAllImages(post) : [];
+      formPublished = post ? (post.published !== 0) : true;
+      setTimeout(renderImagePanel, 0);
+      setTimeout(updateWordCount, 0);
+      // strip legacy [img:...] from body for editing
+      const bodyVal = post ? post.body.replace(/\[img:[^\]]*\]\n?/g, '').trim() : '';
+      return `
+        <div class="post-form" id="post-form" data-edit-id="${post ? post.id : ''}">
+          <h1 id="form-title-heading">${isEdit ? esc(post.title) : 'New post'}</h1>
+          <input id="p-title" type="text" placeholder="Title" value="${post ? esc(post.title) : ''}" autofocus oninput="updateFormTitle(this.value)">
+          <div class="form-cols">
+            <div class="form-img-col">
+              <div class="form-col-label">Images</div>
+              <div id="img-panel" class="img-panel"></div>
+            </div>
+            <div class="form-text-col">
+              <textarea id="p-body" placeholder="Write something… Use [text](url) for links." oninput="updateWordCount()">${esc(bodyVal)}</textarea>
+              <div class="word-count" id="word-count">0 words</div>
+            </div>
+          </div>
+          <div class="mood-form-section">
+            <div class="form-col-label">Mood</div>
+            <div class="mood-sliders-grid">${renderMoodSliders(parseMood(post ? (post.mood || '{}') : '{}'))}</div>
+          </div>
+          <input id="p-tags" type="text" placeholder="Tags (comma-separated, e.g. tech, news)" value="${post ? esc(post.tags || '') : ''}">
+          <div class="form-actions">
+            <label class="draft-label">
+              <input type="checkbox" id="p-draft" ${!formPublished ? 'checked' : ''} onchange="formPublished = !this.checked"> Save as draft
+            </label>
+            <a href="${isEdit ? '/post/' + post.id : '/'}" class="btn-ghost">Cancel</a>
+            <button class="btn" onclick="submitPost()">${isEdit ? 'Save changes' : 'Publish'}</button>
+          </div>
+        </div>`;
+    }
+
+    // ── auth ─────────────────────────────────────────────────────────────────
     async function loadUser() {
       const res = await fetch('/api/auth/me');
       currentUser = res.ok ? await res.json() : null;
       renderNav();
+      // If home page rendered while auth was unknown, update gate now
+      if (window.location.pathname === '/') {
+        const gate = document.getElementById('home-auth-gate');
+        const wrap = document.getElementById('home-grid-wrap');
+        if (currentUser) {
+          if (gate) gate.remove();
+          if (wrap) wrap.classList.remove('home-blurred');
+        }
+      }
     }
-
     function renderNav() {
       document.getElementById('nav').innerHTML = currentUser
         ? `<a href="/">Posts</a>
@@ -216,7 +710,6 @@
            <a href="/login">Log in</a>
            <a href="/register" class="btn-sm">Sign up</a>`;
     }
-
     async function logout() {
       await fetch('/api/auth/logout', { method: 'POST' });
       currentUser = null;
@@ -225,60 +718,126 @@
     }
 
     // ── pages ────────────────────────────────────────────────────────────────
-
-    page('/', async () => {
-      const posts = await fetch('/api/posts').then(r => r.json());
-      if (!posts.length) return `
-        <div class="empty">
-          <p>No posts yet.</p>
-          ${currentUser
-            ? `<a href="/new" class="btn">Write the first one</a>`
-            : `<a href="/register" class="btn">Sign up to write</a>`}
-        </div>`;
+    page('/', async ({ query }) => {
+      activeTag   = query.tag  || null;
+      searchQuery = query.q    || '';
+      allPosts = await fetch('/api/posts').then(r => r.json());
+      const searchEl = document.getElementById('header-search');
+      if (searchEl) searchEl.value = searchQuery;
+      const tags = getAllTags();
+      const loggedIn = !!currentUser;
       return `
-        <div class="post-list">
-          ${posts.map(p => `
-            <article class="post-card" onclick="navigate('/post/${p.id}')">
-              <h2>${esc(p.title)}</h2>
-              <p>${esc(p.body).slice(0, 140)}${p.body.length > 140 ? '…' : ''}</p>
-              <div class="post-meta">
-                <span class="author">@${esc(p.author)}</span>
-                <span class="date">${fmt(p.created_at)}</span>
+        <div class="home">
+          <div class="home-content">
+            <div class="home-main">
+              <div class="home-toolbar">
+                ${tags.length && loggedIn ? `
+                  <div class="tag-area" id="tag-area">
+                    <button class="tag-toggle-btn" id="tag-toggle-btn" onclick="toggleTagDropdown()">
+                      ${activeTag ? esc(activeTag) : 'Tags'} <span class="tag-caret">▾</span>
+                    </button>
+                    <div class="tag-dropdown hidden" id="tag-dropdown">${renderTagChips(tags)}</div>
+                  </div>` : ''}
+                <div class="view-toggle">
+                  <button class="view-btn${viewMode === 'grid' ? ' active' : ''}" data-view="grid" onclick="setView('grid')" title="Grid view">⊞</button>
+                  <button class="view-btn${viewMode === 'list' ? ' active' : ''}" data-view="list" onclick="setView('list')" title="List view">☰</button>
+                </div>
               </div>
-            </article>
-          `).join('')}
+              <div class="home-grid-wrap${!loggedIn ? ' home-blurred' : ''}" id="home-grid-wrap">
+                <div id="post-list-container">${renderPostListHTML(getFilteredPosts())}</div>
+                ${!loggedIn ? `
+                  <div class="home-auth-gate" id="home-auth-gate">
+                    <div class="gate-card">
+                      <p class="gate-headline">You have to be logged in to see posts</p>
+                      <div class="gate-actions">
+                        <a href="/login" class="btn">Log in</a>
+                        <a href="/register" class="btn-ghost">Sign up</a>
+                      </div>
+                    </div>
+                  </div>` : ''}
+              </div>
+            </div>
+            <div class="quick-panel" id="quick-panel"></div>
+          </div>
         </div>`;
     });
 
     page('/post/:id', async ({ params }) => {
-      const post = await fetch('/api/posts/' + params.id).then(r => r.json());
+      await _userReady;
+      if (!currentUser) { navigate('/login'); return; }
+      const [post, postsData] = await Promise.all([
+        fetch('/api/posts/' + params.id).then(r => r.json()),
+        fetch('/api/posts').then(r => r.json()),
+      ]);
       if (post.error) return `<div class="empty"><p>Post not found.</p><a href="/">← back</a></div>`;
-      const isOwner = currentUser && currentUser.id === post.author_id;
+      if (Array.isArray(postsData)) allPosts = postsData;
+      const isOwner  = currentUser && currentUser.id === post.author_id;
+      const tags     = (post.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+      const images   = getAllImages(post);
+      const bodyHtml = renderBody(post.body, allPosts);
+      const moodHtml = renderMood(post.mood);
+      const backlinks = allPosts.filter(p =>
+        p.id !== post.id && (p.body || '').includes('[[' + post.title + ']]')
+      );
+      const actionsHtml = `
+        <div class="post-actions">
+          
+          ${isOwner ? `
+            <a href="/edit/${post.id}" class="btn-ghost">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-pencil-icon lucide-pencil"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>
+              Edit post</a>
+            <button class="delete-btn" onclick="deletePost(${post.id})">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-trash2-icon lucide-trash-2"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              Delete post</button>
+              <button class="copy-link-btn" onclick="copyPostLink()" id="copy-link-btn">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-copy-icon lucide-copy"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          Copy link</button>
+          ` : ''}
+        </div>`;
       return `
         <div class="post-full">
           <a href="/" class="back">← all posts</a>
-          <h1>${esc(post.title)}</h1>
-          <div class="post-meta">
-            <span class="author">@${esc(post.author)}</span>
-            <span class="date">${fmt(post.created_at)}</span>
+          <div class="post-layout${images.length ? ' has-images' : ''}">
+            ${images.length ? `
+              <div class="post-images" id="post-images-col">
+                <button class="blur-toggle" onclick="toggleImageBlur()" id="blur-toggle-btn">Blur images</button>
+                ${images.map(url => `<img src="${esc(url)}" class="post-img" alt="" loading="lazy" onerror="this.style.display='none'">`).join('')}
+              </div>` : ''}
+            <div class="post-content">
+              ${actionsHtml}
+              <h1>${esc(post.title)}</h1>
+              <div class="post-meta">
+                ${post.published === 0 ? `<span class="draft-badge">Draft</span>` : ''}
+                <span class="author">@${esc(post.author)}</span>
+                <span class="date">${fmt(post.created_at)}</span>
+                <span class="reading-time">${readingTime(post.body)}</span>
+              </div>
+              ${tags.length ? `<div class="post-tags">${tags.map(t => `<a href="/?tag=${encodeURIComponent(t)}" class="tag">${esc(t)}</a>`).join('')}</div>` : ''}
+              ${moodHtml}
+              ${bodyHtml ? `<div class="body">${bodyHtml}</div>` : ''}
+              ${backlinks.length ? `
+                <div class="backlinks">
+                  <div class="backlinks-title">Referenced by</div>
+                  <div class="backlinks-list">${backlinks.map(p => `<a href="/post/${p.id}" class="backlink-ref">${esc(p.title)}</a>`).join('')}</div>
+                </div>` : ''}
+            </div>
           </div>
-          <div class="body">${esc(post.body)}</div>
-          ${isOwner ? `<button class="delete-btn" onclick="deletePost(${post.id})">Delete post</button>` : ''}
         </div>`;
     });
 
-    page('/new', () => {
+    page('/new', async () => {
+      await _userReady;
       if (!currentUser) { navigate('/login'); return; }
-      return `
-        <div class="post-form">
-          <h1>New post</h1>
-          <input id="p-title" type="text" placeholder="Title" autofocus>
-          <textarea id="p-body" placeholder="Write something..."></textarea>
-          <div class="form-actions">
-            <a href="/" class="btn-ghost">Cancel</a>
-            <button class="btn" onclick="submitPost()">Publish</button>
-          </div>
-        </div>`;
+      return renderPostForm(null);
+    });
+
+    page('/edit/:id', async ({ params }) => {
+      await _userReady;
+      if (!currentUser) { navigate('/login'); return; }
+      const post = await fetch('/api/posts/' + params.id).then(r => r.json());
+      if (post.error) return `<div class="empty"><p>Post not found.</p><a href="/">← back</a></div>`;
+      if (post.author_id !== currentUser.id) { navigate('/post/' + params.id); return; }
+      return renderPostForm(post);
     });
 
     page('/login', () => {
@@ -317,20 +876,16 @@
       </div>`);
 
     // ── actions ──────────────────────────────────────────────────────────────
-
     async function login() {
       const email    = document.getElementById('a-email').value.trim();
       const password = document.getElementById('a-password').value;
       const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })
       });
       const data = await res.json();
       if (!res.ok) { showError(data.error); return; }
-      currentUser = data;
-      renderNav();
-      navigate('/');
+      currentUser = data; renderNav(); navigate('/');
     }
 
     async function register() {
@@ -338,36 +893,43 @@
       const email    = document.getElementById('a-email').value.trim();
       const password = document.getElementById('a-password').value;
       const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, email, password })
       });
       const data = await res.json();
       if (!res.ok) { showError(data.error); return; }
-      currentUser = data;
-      renderNav();
-      navigate('/');
+      currentUser = data; renderNav(); navigate('/');
     }
 
     async function submitPost() {
-      const title = document.getElementById('p-title').value.trim();
-      const body  = document.getElementById('p-body').value.trim();
+      const formEl = document.getElementById('post-form');
+      const editId = formEl && formEl.dataset.editId ? Number(formEl.dataset.editId) : null;
+      const title  = document.getElementById('p-title').value.trim();
+      const body   = document.getElementById('p-body').value.trim();
+      const tags   = document.getElementById('p-tags').value.trim();
       if (!title || !body) return;
+      const images  = formImages.slice();
+      const draftEl = document.getElementById('p-draft');
+      const published = (draftEl && draftEl.checked) ? 0 : 1;
+      const getMood = id => { const el = document.getElementById(id); return el ? parseInt(el.value) : 50; };
+      const mood = { vibe: getMood('m-vibe'), tone: getMood('m-tone'), depth: getMood('m-depth') };
+      const payload = editId ? { id: editId, title, body, tags, images, published, mood } : { title, body, tags, images, published, mood };
       const res = await fetch('/api/posts', {
-        method: 'POST',
+        method: editId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, body })
+        body: JSON.stringify(payload)
       });
       if (res.status === 401) { navigate('/login'); return; }
+      if (!res.ok) return;
       const post = await res.json();
+      if (!post || !post.id) return;
       navigate('/post/' + post.id);
     }
 
     async function deletePost(id) {
       if (!confirm('Delete this post?')) return;
       await fetch('/api/posts', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'DELETE', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id })
       });
       navigate('/');
@@ -380,26 +942,45 @@
       el.classList.remove('hidden');
     }
 
-    // ── utils ────────────────────────────────────────────────────────────────
-
-    function esc(str) {
-      return String(str)
-        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    function copyPostLink() {
+      navigator.clipboard.writeText(window.location.href).then(() => {
+        const btn = document.getElementById('copy-link-btn');
+        if (!btn) return;
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = orig; }, 2000);
+      }).catch(() => {});
     }
 
-    function fmt(dt) {
-      return new Date(dt).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });
+    function toggleImageBlur() {
+      const col = document.getElementById('post-images-col');
+      if (!col) return;
+      col.classList.toggle('blurred');
+      const btn = document.getElementById('blur-toggle-btn');
+      if (btn) btn.textContent = col.classList.contains('blurred') ? 'Unblur' : 'Blur images';
+    }
+
+    function updateWordCount() {
+      const ta = document.getElementById('p-body');
+      const el = document.getElementById('word-count');
+      if (!ta || !el) return;
+      const count = ta.value.trim().split(/\s+/).filter(Boolean).length;
+      el.textContent = count + (count === 1 ? ' word' : ' words');
     }
 
     // ── boot ─────────────────────────────────────────────────────────────────
-    // Load the current user first, then let the router render the page
-    // so every page() handler has access to currentUser immediately.
-    loadUser();
+    _userReady = loadUser();
 
-    // Enter key support on auth forms
+    document.addEventListener('click', e => {
+      if (!e.target.closest('#tag-area')) {
+        const dd = document.getElementById('tag-dropdown');
+        if (dd) dd.classList.add('hidden');
+      }
+    });
+
     document.addEventListener('keydown', e => {
       if (e.key !== 'Enter') return;
+      if (e.target.tagName === 'TEXTAREA') return;
       if (document.getElementById('a-password')) {
         if (document.getElementById('a-username')) register();
         else login();
@@ -415,63 +996,255 @@
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #f9f9f6; color: #1a1a1a; min-height: 100vh; }
 
-  /* header */
-  header { display: flex; align-items: center; justify-content: space-between; padding: 16px 40px; border-bottom: 1px solid #eee; background: white; position: sticky; top: 0; z-index: 10; }
-  .logo { font-size: 1.1rem; font-weight: 700; text-decoration: none; color: #1a1a1a; }
-  #nav { display: flex; align-items: center; gap: 20px; }
+  /* ── header ── */
+  header { display: flex; align-items: center; gap: 20px; padding: 12px 32px; border-bottom: 1px solid #eee; background: white; position: sticky; top: 0; z-index: 100; }
+  .logo { font-size: 1.1rem; font-weight: 700; text-decoration: none; color: #1a1a1a; white-space: nowrap; }
+  .header-search-wrap { flex: 1; max-width: 340px; }
+  .header-search-wrap input { padding: 8px 14px; font-size: 0.88rem; border-radius: 20px; border: 1.5px solid #e8e8e8; background: #f9f9f6; height: auto; }
+  .header-search-wrap input:focus { border-color: #0f6e56; background: white; }
+  #nav { display: flex; align-items: center; gap: 16px; margin-left: auto; }
   #nav a { text-decoration: none; color: #666; font-size: 0.9rem; transition: color 0.15s; }
   #nav a:hover, #nav a.active { color: #0f6e56; }
   .nav-user { font-size: 0.85rem; color: #0f6e56; font-weight: 500; }
   .nav-logout { background: none; border: none; color: #aaa; font-size: 0.85rem; cursor: pointer; padding: 0; }
   .nav-logout:hover { color: #e24b4a; }
-  .btn-sm { padding: 6px 14px; background: #0f6e56; color: white !important; border-radius: 6px; font-size: 0.85rem; }
+  .btn-sm { padding: 6px 14px; background: #0f6e56; color: white !important; border-radius: 6px; font-size: 0.85rem; text-decoration: none; }
   .btn-sm:hover { background: #085041; }
 
-  /* layout */
-  main { max-width: 720px; margin: 0 auto; padding: 48px 24px; }
+  /* ── layout ── */
+  main { width: 100%; padding: 36px 32px; }
 
-  /* post list */
-  .post-list { display: flex; flex-direction: column; gap: 16px; }
-  .post-card { background: white; border: 1.5px solid #eee; border-radius: 12px; padding: 24px; cursor: pointer; transition: border-color 0.15s, transform 0.15s; }
-  .post-card:hover { border-color: #0f6e56; transform: translateY(-1px); }
-  .post-card h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 8px; }
-  .post-card p { color: #666; font-size: 0.9rem; line-height: 1.6; margin-bottom: 12px; }
-  .post-meta { display: flex; align-items: center; gap: 12px; }
+  /* ── home layout ── */
+  .home { display: flex; flex-direction: column; }
+  .home-content { display: flex; align-items: flex-start; }
+  .home-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+  .home-toolbar { display: flex; align-items: center; gap: 10px; width:70%; margin: 0 auto;}
+  .view-toggle { margin-left: auto; display: flex; gap: 4px; }
+  .view-btn { width: 32px; height: 32px; border: 1.5px solid #ddd; border-radius: 6px; background: white; color: #999; cursor: pointer; font-size: 1rem; display: flex; align-items: center; justify-content: center; transition: all 0.15s; font-family: inherit; }
+  .view-btn:hover { border-color: #0f6e56; color: #0f6e56; }
+  .view-btn.active { background: #0f6e56; border-color: #0f6e56; color: white; }
+
+  /* ── post grid ── */
+  .post-grid { width: 100%; display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+  .post-tile { background: white; border: 1.5px solid #eee; border-radius: 10px; overflow: hidden; cursor: pointer; transition: transform 0.15s, border-color 0.15s; display: flex; flex-direction: column; }
+  .post-tile:hover { transform: translateY(-2px); border-color: #0f6e56; box-shadow: 0 4px 16px rgba(15,110,86,0.08); }
+  .tile-banner { width: 100%; aspect-ratio: 1 / 1; background: #f0f0ec; background-size: cover; background-position: center; flex-shrink: 0; position: relative; }
+  .post-tile.has-img .tile-banner { background-color: #ddd; }
+  .tile-body { padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 3px; }
+  .tile-title { font-size: 0.72rem; font-weight: 600; color: #1a1a1a; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .tile-meta { font-size: 0.62rem; color: #aaa; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile-eye { position: absolute; top: 6px; right: 6px; width: 26px; height: 26px; border-radius: 50%; background: rgba(0,0,0,0.45); border: none; cursor: pointer; font-size: 0.7rem; color: white; display: flex; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.15s, background 0.15s; }
+  .post-tile:hover .tile-eye { opacity: 1; }
+  .tile-eye:hover { background: rgba(0,0,0,0.72); }
+
+  /* ── post list view ── */
+  .post-list { display: flex; flex-direction: column; gap: 8px; }
+  .post-card { display: flex; align-items: stretch; background: white; border: 1.5px solid #eee; border-radius: 10px; overflow: hidden; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; }
+  .post-card:hover { border-color: #0f6e56; box-shadow: 0 2px 12px rgba(15,110,86,0.08); }
+  .post-thumb { width: 90px; flex-shrink: 0; background-size: cover; background-position: center; }
+  .post-card-body { flex: 1; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .post-card-title { font-size: 0.95rem; font-weight: 600; color: #1a1a1a; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .post-card-preview { font-size: 0.8rem; color: #888; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .post-card-meta { font-size: 0.72rem; color: #aaa; margin-top: auto; }
+  .card-eye { flex-shrink: 0; align-self: center; width: 32px; height: 32px; border-radius: 50%; background: none; border: 1.5px solid #eee; cursor: pointer; font-size: 0.78rem; color: #bbb; display: flex; align-items: center; justify-content: center; margin-right: 10px; transition: all 0.15s; }
+  .card-eye:hover { border-color: #0f6e56; color: #0f6e56; }
+
+  /* ── quick view panel ── */
+  .quick-panel { flex-shrink: 0; width: 0; overflow: hidden; transition: width 0.28s ease; position: sticky; top: 57px; max-height: calc(100vh - 57px); overflow-y: auto; background: white; border-left: none; }
+  .quick-panel.open { width: clamp(260px, 33vw, 480px); border-left: 1.5px solid #eee; }
+  .qv-inner { display: flex; flex-direction: column; gap: 14px; padding: 20px; min-width: clamp(260px, 33vw, 480px); }
+  .qv-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .qv-title { font-size: 1rem; font-weight: 700; color: #1a1a1a; line-height: 1.3; flex: 1; }
+  .qv-close { background: none; border: none; cursor: pointer; color: #bbb; font-size: 1.4rem; line-height: 1; padding: 0; flex-shrink: 0; }
+  .qv-close:hover { color: #444; }
+  .qv-banner { width: 100%; aspect-ratio: 16 / 9; background-size: cover; background-position: center; border-radius: 8px; }
+  .qv-meta { font-size: 0.78rem; color: #aaa; }
+  .qv-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .qv-content { font-size: 0.88rem; }
+  .qv-content .body-md { font-size: 0.88rem; gap: 8px; }
+  .qv-footer { padding-top: 10px; border-top: 1.5px solid #eee; }
+  .qv-loading { color: #bbb; font-size: 0.9rem; padding: 40px 0; text-align: center; }
+
+  /* ── tag dropdown ── */
+  .tag-area { position: relative; }
+  .tag-toggle-btn { display: flex; align-items: center; gap: 5px; padding: 6px 12px; border: 1.5px solid #ddd; border-radius: 20px; background: white; color: #555; font-size: 0.82rem; cursor: pointer; font-family: inherit; transition: all 0.15s; white-space: nowrap; }
+  .tag-toggle-btn:hover { border-color: #0f6e56; color: #0f6e56; }
+  .tag-caret { font-size: 0.65rem; opacity: 0.6; }
+  .tag-dropdown { position: absolute; top: calc(100% + 6px); left: 0; z-index: 200; background: white; border: 1.5px solid #eee; border-radius: 10px; padding: 10px; display: flex; flex-wrap: wrap; gap: 6px; min-width: 220px; max-width: 400px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+  .tag-dropdown.hidden { display: none; }
+  .tag-chip { padding: 4px 11px; border-radius: 20px; border: 1.5px solid #ddd; background: white; color: #666; font-size: 0.78rem; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+  .tag-chip:hover { border-color: #0f6e56; color: #0f6e56; }
+  .tag-chip.active { background: #0f6e56; color: white; border-color: #0f6e56; }
+
+  /* ── post meta (used in grid tiles + post view) ── */
+  .post-meta { display: flex; align-items: center; gap: 12px; margin-top: auto; padding-top: 2px; }
   .author { font-size: 0.8rem; color: #0f6e56; font-weight: 500; }
   .date { font-size: 0.8rem; color: #aaa; }
 
-  /* post full */
-  .post-full { display: flex; flex-direction: column; gap: 16px; }
-  .post-full h1 { font-size: 2rem; font-weight: 700; line-height: 1.3; }
-  .post-full .body { font-size: 1rem; line-height: 1.8; color: #333; white-space: pre-wrap; margin-top: 8px; }
+  /* ── post full / two-column view ── */
+  .post-full { background: white; padding: 10px; border-radius:15px; border:1px solid #f3f3f3; display: flex; flex-direction: column; gap: 16px; max-width: 860px; margin: 0 auto; box-shadow: #1a1a1a; }
+  .post-layout { display: flex; gap: 28px; align-items: flex-start; }
+  .post-images { flex: 0 0 220px; display: flex; flex-direction: column; gap: 10px; }
+  .post-img { width: 100%; border-radius: 10px; display: block; }
+  .post-content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+  .post-content h1 { font-size: 1.9rem; font-weight: 700; line-height: 1.3; }
+  .body { font-size: 1rem; line-height: 1.8; color: #333; }
+  .body-text { white-space: pre-wrap; }
+  .body a { color: #0f6e56; text-decoration: underline; }
+  .body a:hover { color: #085041; }
   .back { color: #0f6e56; text-decoration: none; font-size: 0.9rem; }
   .back:hover { text-decoration: underline; }
-  .delete-btn { align-self: flex-start; margin-top: 24px; padding: 8px 16px; background: none; border: 1.5px solid #eee; border-radius: 8px; color: #ccc; font-size: 0.85rem; cursor: pointer; }
+  .post-actions { display: flex; align-items: center; gap: 10px; padding-top: 4px; }
+  .delete-btn { padding: 8px 16px; background: none; border: 1.5px solid #eee; border-radius: 8px; color: #ccc; font-size: 0.85rem; cursor: pointer; }
   .delete-btn:hover { border-color: #e24b4a; color: #e24b4a; }
 
-  /* forms */
-  .post-form, .auth-form { display: flex; flex-direction: column; gap: 14px; max-width: 480px; }
-  .post-form { max-width: 100%; }
-  .post-form h1, .auth-form h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 4px; }
-  input, textarea { width: 100%; padding: 11px 14px; border: 1.5px solid #ddd; border-radius: 10px; font-size: 0.95rem; font-family: inherit; outline: none; background: white; }
-  input:focus, textarea:focus { border-color: #0f6e56; }
-  textarea { min-height: 240px; resize: vertical; line-height: 1.7; }
-  .form-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  /* ── editor form – two-column ── */
+  .post-form { display: flex; flex-direction: column; gap: 14px; max-width: 980px; margin: 0 auto; }
+  .post-form h1 { font-size: 1.6rem; font-weight: 700; }
+  .form-cols { display: flex; gap: 18px; align-items: flex-start; }
+  .form-img-col { flex: 0 0 210px; display: flex; flex-direction: column; gap: 8px; }
+  .form-col-label { font-size: 0.73rem; font-weight: 700; color: #aaa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .form-text-col { flex: 1; }
+  .form-text-col textarea { min-height: 300px; }
+
+  /* image panel items */
+  .img-panel { display: flex; flex-direction: column; gap: 8px; }
+  .img-item { position: relative; border-radius: 8px; overflow: hidden; background: #f0f0ec; }
+  .img-item-thumb { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block; }
+  .img-item-remove { position: absolute; top: 5px; right: 5px; width: 22px; height: 22px; border-radius: 50%; background: rgba(0,0,0,0.55); color: white; border: none; cursor: pointer; font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center; }
+  .img-item-remove:hover { background: #e24b4a; }
+
+  /* add-image controls */
+  .img-add-section { display: flex; flex-direction: column; gap: 6px; }
+  .img-add-row { display: flex; gap: 6px; }
+  .img-add-row input { flex: 1; min-width: 0; }
+  .img-add-btn { padding: 0 12px; height: 42px; background: #0f6e56; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.85rem; white-space: nowrap; flex-shrink: 0; }
+  .img-add-btn:hover { background: #085041; }
+  .img-url-preview img { max-width: 100%; max-height: 72px; border-radius: 6px; object-fit: cover; display: block; }
+  .img-upload-btn { display: flex; align-items: center; justify-content: center; padding: 7px 10px; border: 1.5px solid #ddd; border-radius: 8px; background: white; color: #666; font-size: 0.82rem; cursor: pointer; transition: all 0.15s; }
+  .img-upload-btn:hover { border-color: #0f6e56; color: #0f6e56; }
+
+  /* ── auth forms ── */
+  .auth-form { display: flex; flex-direction: column; gap: 14px; max-width: 420px; margin: 0 auto; }
+  .auth-form h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 4px; }
   .auth-error { background: #fff0f0; border: 1.5px solid #fcc; border-radius: 8px; padding: 10px 14px; color: #c00; font-size: 0.9rem; }
   .auth-error.hidden { display: none; }
   .auth-switch { font-size: 0.85rem; color: #999; text-align: center; }
   .auth-switch a { color: #0f6e56; text-decoration: none; }
 
-  /* buttons */
+  /* ── shared inputs ── */
+  input, textarea { width: 100%; padding: 11px 14px; border: 1.5px solid #ddd; border-radius: 10px; font-size: 0.95rem; font-family: inherit; outline: none; background: white; }
+  input:focus, textarea:focus { border-color: #0f6e56; }
+  textarea { resize: vertical; line-height: 1.7; }
+  .form-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+  /* ── buttons ── */
   .btn { display: inline-block; padding: 10px 20px; background: #0f6e56; color: white; border: none; border-radius: 8px; font-size: 0.95rem; cursor: pointer; text-decoration: none; text-align: center; }
   .btn:hover { background: #085041; }
-  .btn-ghost { display: inline-block; padding: 10px 20px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.95rem; color: #666; text-decoration: none; }
+  .btn-ghost { display: inline-block; padding: 9px 18px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.92rem; color: #666; text-decoration: none; background: white; cursor: pointer; font-family: inherit; }
   .btn-ghost:hover { border-color: #aaa; }
 
-  /* misc */
+  /* ── post tags (post view) ── */
+  .post-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { padding: 2px 8px; border-radius: 12px; background: #f0f0ec; color: #555; font-size: 0.75rem; cursor: pointer; text-decoration: none; display: inline-block; transition: all 0.15s; }
+  .tag:hover { background: #0f6e56; color: white; }
+
+  /* ── misc ── */
   .empty { text-align: center; padding: 80px 0; display: flex; flex-direction: column; align-items: center; gap: 16px; color: #999; }
-  .about { display: flex; flex-direction: column; gap: 16px; max-width: 560px; }
+  .about { display: flex; flex-direction: column; gap: 16px; max-width: 560px; margin: 0 auto; }
   .about h1 { font-size: 1.6rem; font-weight: 700; }
   .about p { color: #555; line-height: 1.7; }
   .about code { background: #f0f0ec; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+
+  /* ── markdown body ── */
+  .body-md { display: flex; flex-direction: column; gap: 12px; font-size: 1rem; line-height: 1.8; color: #333; }
+  .body-md .md-p { white-space: pre-wrap; }
+  .body-md .md-h { font-weight: 700; color: #1a1a1a; line-height: 1.3; }
+  .body-md h1.md-h { font-size: 1.45rem; }
+  .body-md h2.md-h { font-size: 1.2rem; }
+  .body-md h3.md-h { font-size: 1rem; }
+  .body-md .md-bq { border-left: 3px solid #0f6e56; padding: 8px 14px; background: #f4faf7; border-radius: 0 6px 6px 0; color: #555; font-style: italic; margin: 0; }
+  .body-md .md-hr { border: none; border-top: 1.5px solid #eee; }
+  .md-code { background: #f0f0ec; border: 1px solid #e0e0dc; border-radius: 4px; padding: 1px 5px; font-family: 'Menlo', 'Consolas', monospace; font-size: 0.875em; color: #c7254e; }
+  .body-md a { color: #0f6e56; text-decoration: underline; }
+  .body-md a:hover { color: #085041; }
+  .backlink { color: #0f6e56; text-decoration: none; border-bottom: 1px dotted #0f6e56; font-weight: 500; }
+  .backlink:hover { color: #085041; }
+  .backlink-missing { color: #bbb; font-style: italic; }
+
+  /* ── backlinks section ── */
+  .backlinks { padding-top: 16px; border-top: 1.5px solid #eee; display: flex; flex-direction: column; gap: 8px; }
+  .backlinks-title { font-size: 0.72rem; font-weight: 700; color: #aaa; text-transform: uppercase; letter-spacing: 0.06em; }
+  .backlinks-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .backlink-ref { display: inline-block; padding: 4px 10px; border: 1.5px solid #ddd; border-radius: 6px; font-size: 0.85rem; color: #0f6e56; text-decoration: none; transition: all 0.15s; }
+  .backlink-ref:hover { border-color: #0f6e56; background: #f4faf7; }
+
+  /* ── mood display (post view) ── */
+  .mood-display { display: flex; flex-direction: column; gap: 5px; padding: 8px 0; }
+  .mood-disp-row { display: flex; align-items: center; gap: 8px; }
+  .mood-disp-lo, .mood-disp-hi { font-size: 0.72rem; color: #aaa; min-width: 52px; white-space: nowrap; }
+  .mood-disp-hi { text-align: right; }
+  .mood-track { flex: 1; height: 4px; background: #eee; border-radius: 2px; overflow: hidden; }
+  .mood-fill { height: 100%; background: linear-gradient(90deg, #a8d5c5, #0f6e56); border-radius: 2px; }
+
+  /* ── mood sliders (editor) ── */
+  .mood-form-section { display: flex; flex-direction: column; gap: 6px; }
+  .mood-sliders-grid { display: flex; flex-direction: column; gap: 4px; }
+  .mood-slider-row { display: flex; align-items: center; gap: 8px; }
+  .mood-slider-label { width: 46px; font-size: 0.78rem; font-weight: 600; color: #666; flex-shrink: 0; }
+  .mood-side { font-size: 0.72rem; color: #aaa; min-width: 50px; white-space: nowrap; }
+  .mood-side:last-child { text-align: right; }
+  input.mood-range { flex: 1; height: 4px; accent-color: #0f6e56; cursor: pointer; padding: 0; border: none; background: transparent; min-width: 0; }
+
+  /* ── blur toggle ── */
+  .post-img { transition: filter 0.3s; }
+  .post-images.blurred .post-img { filter: blur(10px); }
+  .blur-toggle { align-self: flex-start; padding: 4px 10px; border: 1.5px solid #ddd; border-radius: 6px; background: white; color: #888; font-size: 0.75rem; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+  .blur-toggle:hover { border-color: #aaa; color: #444; }
+
+  /* ── reading time & draft ── */
+  .reading-time { font-size: 0.78rem; color: #bbb; }
+  .draft-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; background: #fff8e1; color: #b45309; font-size: 0.72rem; font-weight: 700; border: 1px solid #fcd34d; letter-spacing: 0.03em; }
+
+  /* ── editor extras ── */
+  .word-count { font-size: 0.78rem; color: #bbb; text-align: right; margin-top: 4px; }
+  .draft-label { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; color: #666; cursor: pointer; }
+  .draft-label input[type="checkbox"] { width: auto; accent-color: #0f6e56; }
+
+  /* ── auth gate (home) ── */
+  .home-grid-wrap { position: relative; width: 70%; margin: 0 auto;}
+  .home-blurred #post-list-container { filter: blur(8px); pointer-events: none; user-select: none; }
+  .home-auth-gate { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 5; }
+  .gate-card { background: white; border: 1.5px solid #eee; border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.13); padding: 36px 44px; display: flex; flex-direction: column; align-items: center; gap: 18px; text-align: center; }
+  .gate-headline { font-size: 1rem; font-weight: 600; color: #1a1a1a; line-height: 1.4; }
+  .gate-actions { display: flex; gap: 10px; }
+
+  /* ── copy link ── */
+  .copy-link-btn { padding: 8px 14px; background: none; border: 1.5px solid #eee; border-radius: 8px; color: #999; font-size: 0.82rem; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+  .copy-link-btn:hover { border-color: #0f6e56; color: #0f6e56; }
+
+  /* ── responsive ── */
+  @media (max-width: 1100px) {
+    .post-grid { grid-template-columns: repeat(4, 1fr); }
+    .quick-panel.open { width: clamp(240px, 30vw, 380px); }
+    .qv-inner { min-width: clamp(240px, 30vw, 380px); }
+  }
+  @media (max-width: 900px) {
+    .post-grid { grid-template-columns: repeat(3, 1fr); }
+    .quick-panel.open { width: clamp(220px, 40vw, 340px); }
+    .qv-inner { min-width: clamp(220px, 40vw, 340px); }
+  }
+  @media (max-width: 600px) {
+    header { padding: 10px 16px; gap: 10px; }
+    .header-search-wrap { max-width: 140px; }
+    main { padding: 24px 14px; }
+    .post-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .quick-panel.open { position: fixed; top: 0; right: 0; bottom: 0; width: 85vw !important; max-height: 100vh; z-index: 300; box-shadow: -4px 0 24px rgba(0,0,0,0.15); border-left: 1.5px solid #eee; }
+    .qv-inner { min-width: 0; }
+    .post-layout { flex-direction: column; }
+    .post-images { flex: none; flex-direction: row; overflow-x: auto; gap: 8px; }
+    .post-img { width: 150px; height: 110px; object-fit: cover; flex-shrink: 0; }
+    .form-cols { flex-direction: column; }
+    .form-img-col { flex: none; width: 100%; }
+  }
 </style>

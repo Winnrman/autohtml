@@ -1,0 +1,131 @@
+<db type="sqlite">
+  CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+</db>
+
+<server lang="python">
+import datetime
+
+@app.get('/api/notes')
+def list_notes(req, res):
+    res.json(db.query('SELECT * FROM notes ORDER BY id DESC'))
+
+@app.get('/api/notes/:id')
+def get_note(req, res):
+    note = db.get('SELECT * FROM notes WHERE id = ?', [req.params['id']])
+    if not note:
+        res.status(404).json({'error': 'not found'})
+        return
+    res.json(note)
+
+@app.post('/api/notes')
+def create_note(req, res):
+    title = (req.body or {}).get('title')
+    if not title:
+        res.status(400).json({'error': 'title required'})
+        return
+    body = (req.body or {}).get('body', '')
+    result = db.run('INSERT INTO notes (title, body) VALUES (?, ?)', [title, body])
+    res.json(db.get('SELECT * FROM notes WHERE id = ?', [result['lastInsertRowid']]))
+
+@app.put('/api/notes')
+def update_note(req, res):
+    data = req.body or {}
+    db.run('UPDATE notes SET title = ?, body = ? WHERE id = ?',
+           [data.get('title'), data.get('body', ''), data.get('id')])
+    res.json(db.get('SELECT * FROM notes WHERE id = ?', [data.get('id')]))
+
+@app.delete('/api/notes')
+def delete_note(req, res):
+    db.run('DELETE FROM notes WHERE id = ?', [(req.body or {}).get('id')])
+    res.json({'ok': True})
+
+@app.get('/api/time')
+def server_time(req, res):
+    res.json({'now': datetime.datetime.now().isoformat(), 'echo': req.query})
+</server>
+
+<client>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Python Notes</title>
+</head>
+<body>
+  <div class="app">
+    <h1>notes <span class="badge" id="count">0</span></h1>
+    <div class="input-row">
+      <input id="title" type="text" placeholder="note title...">
+      <button onclick="addNote()">add</button>
+    </div>
+    <ul id="list"></ul>
+  </div>
+
+  <script>
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    async function load() {
+      const notes = await fetch('/api/notes').then(r => r.json());
+      document.getElementById('count').textContent = notes.length;
+      const list = document.getElementById('list');
+      list.innerHTML = notes.length
+        ? notes.map(n => `<li><span>${esc(n.title)}</span><button class="del" onclick="remove(${n.id})">×</button></li>`).join('')
+        : '<li class="empty">No notes yet.</li>';
+    }
+
+    async function addNote() {
+      const inp = document.getElementById('title');
+      if (!inp.value.trim()) return;
+      await fetch('/api/notes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: inp.value.trim() })
+      });
+      inp.value = '';
+      load();
+    }
+
+    async function remove(id) {
+      await fetch('/api/notes', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      load();
+    }
+
+    document.getElementById('title').addEventListener('keydown', e => {
+      if (e.key === 'Enter') addNote();
+    });
+
+    load();
+  </script>
+</body>
+</html>
+</client>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, 'Inter', sans-serif; background: #faf9f6; min-height: 100vh; display: flex; justify-content: center; padding: 60px 20px; }
+  .app { width: 100%; max-width: 480px; }
+  h1 { font-size: 2.4rem; font-weight: 700; color: #1a1a1a; margin-bottom: 24px; display: flex; align-items: center; gap: 12px; }
+  .badge { background: #0f6e56; color: white; font-size: 0.9rem; padding: 2px 10px; border-radius: 99px; }
+  .input-row { display: flex; gap: 8px; margin-bottom: 20px; }
+  input { flex: 1; padding: 10px 14px; border: 1.5px solid #ddd; border-radius: 10px; font-size: 1rem; outline: none; background: white; }
+  input:focus { border-color: #0f6e56; }
+  button { padding: 10px 18px; background: #0f6e56; color: white; border: none; border-radius: 10px; font-size: 1rem; cursor: pointer; }
+  button:hover { background: #085041; }
+  ul { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+  li { background: white; padding: 14px 16px; border-radius: 12px; border: 1.5px solid #eee; display: flex; align-items: center; justify-content: space-between; }
+  li.empty { color: #aaa; justify-content: center; border-style: dashed; }
+  .del { background: none; border: none; color: #ccc; font-size: 1.1rem; padding: 0 4px; }
+  .del:hover { color: #e24b4a; }
+</style>

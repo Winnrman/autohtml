@@ -1,0 +1,919 @@
+<db type="sqlite">
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS communities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    post_type TEXT NOT NULL DEFAULT 'text',
+    image_url TEXT NOT NULL DEFAULT '',
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    score INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS votes (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (user_id, post_id)
+  );
+  CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    body TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS reactions (
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    emoji TEXT NOT NULL,
+    PRIMARY KEY (post_id, user_id, emoji)
+  );
+  INSERT OR IGNORE INTO communities (id, name, description) VALUES
+    (1, 'programming', 'A subreddit for all things programming'),
+    (2, 'technology', 'News and discussion about tech'),
+    (3, 'askreddit', 'Ask the community anything'),
+    (4, 'showoff', 'Show what you built');
+</db>
+
+<server lang="node">
+  const crypto = require('crypto');
+
+  function hashPassword(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+    return salt + ':' + hash;
+  }
+
+  function verifyPassword(password, stored) {
+    const [salt, hash] = stored.split(':');
+    const attempt = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
+    return attempt === hash;
+  }
+
+  function randomToken() { return crypto.randomBytes(32).toString('hex'); }
+
+  function parseCookies(cookieHeader) {
+    const cookies = {};
+    if (!cookieHeader) return cookies;
+    cookieHeader.split(';').forEach(c => {
+      const [k, ...v] = c.trim().split('=');
+      cookies[k.trim()] = v.join('=').trim();
+    });
+    return cookies;
+  }
+
+  function getSession(req) {
+    const token = parseCookies(req.headers.cookie).session;
+    if (!token) return null;
+    return db.get(
+      'SELECT s.*, u.id as user_id, u.username FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
+      [token]
+    ) || null;
+  }
+
+  function requireAuth(req, res) {
+    const session = getSession(req);
+    if (!session) { res.status(401).json({ error: 'not authenticated' }); return null; }
+    return session;
+  }
+
+  // ── auth ─────────────────────────────────────────────────────────────────
+
+  app.post('/api/auth/register', (req, res) => {
+    const { username, email, password } = req.body;
+    if (!username || !email || !password) { res.status(400).json({ error: 'all fields required' }); return; }
+    if (password.length < 6) { res.status(400).json({ error: 'password must be at least 6 characters' }); return; }
+    if (db.get('SELECT id FROM users WHERE username = ? OR email = ?', [username, email])) {
+      res.status(409).json({ error: 'username or email already taken' }); return;
+    }
+    const result = db.run('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+      [username, email, hashPassword(password)]);
+    const token = randomToken();
+    db.run('INSERT INTO sessions (token, user_id) VALUES (?, ?)', [token, result.lastInsertRowid]);
+    res.set('Set-Cookie', 'session=' + token + '; HttpOnly; Path=/; SameSite=Lax');
+    res.json({ id: result.lastInsertRowid, username, email });
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) { res.status(400).json({ error: 'email and password required' }); return; }
+    const user = db.get('SELECT * FROM users WHERE email = ?', [email]);
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      res.status(401).json({ error: 'invalid email or password' }); return;
+    }
+    const token = randomToken();
+    db.run('INSERT INTO sessions (token, user_id) VALUES (?, ?)', [token, user.id]);
+    res.set('Set-Cookie', 'session=' + token + '; HttpOnly; Path=/; SameSite=Lax');
+    res.json({ id: user.id, username: user.username, email: user.email });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const token = parseCookies(req.headers.cookie).session;
+    if (token) db.run('DELETE FROM sessions WHERE token = ?', [token]);
+    res.set('Set-Cookie', 'session=; HttpOnly; Path=/; Max-Age=0');
+    res.json({ ok: true });
+  });
+
+  app.get('/api/auth/me', (req, res) => {
+    const session = getSession(req);
+    if (!session) { res.status(401).json({ error: 'not authenticated' }); return; }
+    res.json({ id: session.user_id, username: session.username });
+  });
+
+  // ── communities ───────────────────────────────────────────────────────────
+
+  app.get('/api/communities', (req, res) => {
+    res.json(db.query(`
+      SELECT c.*, (SELECT COUNT(*) FROM posts WHERE community_id = c.id) as post_count
+      FROM communities c ORDER BY post_count DESC, c.created_at ASC
+    `));
+  });
+
+  app.post('/api/communities', (req, res) => {
+    const session = requireAuth(req, res);
+    if (!session) return;
+    const { name, description } = req.body;
+    if (!name) { res.status(400).json({ error: 'name required' }); return; }
+    const safe = String(name).toLowerCase().replace(/[^a-z0-9_]/g, '');
+    if (!safe) { res.status(400).json({ error: 'invalid community name' }); return; }
+    if (db.get('SELECT id FROM communities WHERE name = ?', [safe])) {
+      res.status(409).json({ error: 'community already exists' }); return;
+    }
+    const result = db.run('INSERT INTO communities (name, description, created_by) VALUES (?, ?, ?)',
+      [safe, description || '', session.user_id]);
+    res.json(db.get('SELECT * FROM communities WHERE id = ?', [result.lastInsertRowid]));
+  });
+
+  app.get('/api/communities/:name', (req, res) => {
+    const name = req.path.split('/')[3];
+    const community = db.get(`
+      SELECT c.*, (SELECT COUNT(*) FROM posts WHERE community_id = c.id) as post_count
+      FROM communities c WHERE c.name = ?
+    `, [name]);
+    if (!community) { res.status(404).json({ error: 'not found' }); return; }
+    res.json(community);
+  });
+
+  // ── posts ─────────────────────────────────────────────────────────────────
+
+  app.get('/api/posts', (req, res) => {
+    const session = getSession(req);
+    const userId = session ? session.user_id : null;
+    const community = req.query.community;
+    const sort = req.query.sort || 'top';
+    const limit = Math.min(parseInt(req.query.limit) || 25, 100);
+    let sql = `
+      SELECT p.*, u.username as author, c.name as community_name,
+        COALESCE(v.value, 0) as user_vote,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      FROM posts p
+      JOIN users u ON u.id = p.author_id
+      JOIN communities c ON c.id = p.community_id
+      LEFT JOIN votes v ON v.post_id = p.id AND v.user_id = ?
+    `;
+    const params = [userId];
+    if (community) { sql += ' WHERE c.name = ?'; params.push(community); }
+    sql += sort === 'new' ? ' ORDER BY p.created_at DESC' : ' ORDER BY p.score DESC, p.created_at DESC';
+    sql += ' LIMIT ?';
+    params.push(limit);
+    res.json(db.query(sql, params));
+  });
+
+  app.get('/api/posts/:id', (req, res) => {
+    const session = getSession(req);
+    const userId = session ? session.user_id : null;
+    const id = req.path.split('/')[3];
+    const post = db.get(`
+      SELECT p.*, u.username as author, c.name as community_name,
+        COALESCE(v.value, 0) as user_vote,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      FROM posts p
+      JOIN users u ON u.id = p.author_id
+      JOIN communities c ON c.id = p.community_id
+      LEFT JOIN votes v ON v.post_id = p.id AND v.user_id = ?
+      WHERE p.id = ?
+    `, [userId, id]);
+    if (!post) { res.status(404).json({ error: 'not found' }); return; }
+    res.json(post);
+  });
+
+  app.post('/api/posts', (req, res) => {
+    const session = requireAuth(req, res);
+    if (!session) return;
+    const { title, body, community_name } = req.body;
+    if (!title || !community_name) { res.status(400).json({ error: 'title and community required' }); return; }
+    const community = db.get('SELECT id FROM communities WHERE name = ?', [community_name]);
+    if (!community) { res.status(404).json({ error: 'community not found' }); return; }
+    const result = db.run(
+      'INSERT INTO posts (title, body, community_id, author_id, score) VALUES (?, ?, ?, ?, 1)',
+      [title, body || '', community.id, session.user_id]
+    );
+    db.run('INSERT OR IGNORE INTO votes (user_id, post_id, value) VALUES (?, ?, 1)',
+      [session.user_id, result.lastInsertRowid]);
+    res.json(db.get(`
+      SELECT p.*, u.username as author, c.name as community_name
+      FROM posts p JOIN users u ON u.id = p.author_id JOIN communities c ON c.id = p.community_id
+      WHERE p.id = ?
+    `, [result.lastInsertRowid]));
+  });
+
+  // ── votes ─────────────────────────────────────────────────────────────────
+
+  app.post('/api/vote', (req, res) => {
+    const session = requireAuth(req, res);
+    if (!session) return;
+    const { post_id, value } = req.body;
+    if (!post_id || ![-1, 0, 1].includes(value)) {
+      res.status(400).json({ error: 'post_id and value (-1, 0, or 1) required' }); return;
+    }
+    const existing = db.get('SELECT value FROM votes WHERE user_id = ? AND post_id = ?', [session.user_id, post_id]);
+    const oldVal = existing ? existing.value : 0;
+    const delta = value - oldVal;
+    if (value === 0) {
+      db.run('DELETE FROM votes WHERE user_id = ? AND post_id = ?', [session.user_id, post_id]);
+    } else {
+      db.run('INSERT OR REPLACE INTO votes (user_id, post_id, value) VALUES (?, ?, ?)', [session.user_id, post_id, value]);
+    }
+    db.run('UPDATE posts SET score = score + ? WHERE id = ?', [delta, post_id]);
+    const post = db.get('SELECT score FROM posts WHERE id = ?', [post_id]);
+    res.json({ score: post.score, user_vote: value });
+  });
+
+  // ── comments ──────────────────────────────────────────────────────────────
+
+  app.get('/api/comments', (req, res) => {
+    const post_id = req.query.post_id;
+    if (!post_id) { res.status(400).json({ error: 'post_id required' }); return; }
+    res.json(db.query(`
+      SELECT c.*, u.username as author FROM comments c
+      JOIN users u ON u.id = c.author_id
+      WHERE c.post_id = ? ORDER BY c.created_at ASC
+    `, [post_id]));
+  });
+
+  app.post('/api/comments', (req, res) => {
+    const session = requireAuth(req, res);
+    if (!session) return;
+    const { post_id, body } = req.body;
+    if (!post_id || !body) { res.status(400).json({ error: 'post_id and body required' }); return; }
+    const result = db.run('INSERT INTO comments (post_id, author_id, body) VALUES (?, ?, ?)',
+      [post_id, session.user_id, body]);
+    res.json(db.get(`
+      SELECT c.*, u.username as author FROM comments c
+      JOIN users u ON u.id = c.author_id WHERE c.id = ?
+    `, [result.lastInsertRowid]));
+  });
+
+  // ── search ────────────────────────────────────────────────────────────────
+
+  app.get('/api/search', (req, res) => {
+    const q = req.query.q;
+    if (!q || q.trim().length < 2) { res.json([]); return; }
+    const term = '%' + q.trim() + '%';
+    res.json(db.query(`
+      SELECT p.*, u.username as author, c.name as community_name,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+      FROM posts p
+      JOIN users u ON u.id = p.author_id
+      JOIN communities c ON c.id = p.community_id
+      WHERE p.title LIKE ? OR p.body LIKE ?
+      ORDER BY p.score DESC LIMIT 50
+    `, [term, term]));
+  });
+</server>
+
+<client>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ahtml reddit</title>
+</head>
+<body>
+  <header>
+    <a class="logo" onclick="navigate('/')">ahtml</a>
+    <form class="search-form" onsubmit="doSearch(event)">
+      <input id="search-input" type="text" placeholder="Search posts..." autocomplete="off">
+      <button type="submit">Search</button>
+    </form>
+    <nav id="nav"></nav>
+  </header>
+
+  <div class="layout">
+    <main id="app"></main>
+    <aside id="sidebar"></aside>
+  </div>
+
+  <script>
+    // ── state ────────────────────────────────────────────────────────────────
+    let currentUser = null;
+
+    async function loadUser() {
+      const res = await fetch('/api/auth/me');
+      currentUser = res.ok ? await res.json() : null;
+      renderNav();
+    }
+
+    function renderNav() {
+      document.getElementById('nav').innerHTML = currentUser
+        ? `<span class="nav-user">u/${esc(currentUser.username)}</span>
+           <button class="btn-pill" onclick="navigate('/submit')">+ New Post</button>
+           <button class="nav-logout" onclick="logout()">Log out</button>`
+        : `<a class="nav-link" onclick="navigate('/login')">Log in</a>
+           <button class="btn-pill" onclick="navigate('/register')">Sign up</button>`;
+    }
+
+    async function logout() {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      currentUser = null;
+      renderNav();
+      navigate('/');
+    }
+
+    function doSearch(e) {
+      e.preventDefault();
+      const q = document.getElementById('search-input').value.trim();
+      if (q) navigate('/search?q=' + encodeURIComponent(q));
+    }
+
+    // ── pages ────────────────────────────────────────────────────────────────
+
+    page('/', async () => {
+      const [posts, communities] = await Promise.all([
+        fetch('/api/posts?sort=top&limit=25').then(r => r.json()),
+        fetch('/api/communities').then(r => r.json()),
+      ]);
+      renderSidebar(communities);
+      return `
+        <div class="feed-header">
+          <span class="feed-title">Hot</span>
+          <div class="sort-tabs">
+            <button class="sort-tab active" onclick="setSort('top', event)">Top</button>
+            <button class="sort-tab" onclick="setSort('new', event)">New</button>
+          </div>
+        </div>
+        <div id="post-list">${renderPostList(posts)}</div>`;
+    });
+
+    page('/communities', async () => {
+      const communities = await fetch('/api/communities').then(r => r.json());
+      renderSidebar(communities);
+      return `
+        <div class="feed-header">
+          <span class="feed-title">All Communities</span>
+          ${currentUser ? `<button class="btn-pill" onclick="navigate('/create-community')">+ Create</button>` : ''}
+        </div>
+        <div class="community-grid">
+          ${communities.map(c => `
+            <div class="community-card" onclick="navigate('/r/${esc(c.name)}')">
+              <div class="c-icon">r/</div>
+              <div class="c-info">
+                <strong>r/${esc(c.name)}</strong>
+                <p>${esc(c.description)}</p>
+                <span class="stat">${c.post_count} post${c.post_count !== 1 ? 's' : ''}</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>`;
+    });
+
+    page('/r/:name', async ({ params }) => {
+      const [community, posts, communities] = await Promise.all([
+        fetch('/api/communities/' + params.name).then(r => r.json()),
+        fetch('/api/posts?community=' + params.name + '&sort=top').then(r => r.json()),
+        fetch('/api/communities').then(r => r.json()),
+      ]);
+      if (community.error) return `<div class="empty"><p>Community not found.</p><button class="btn-pill" onclick="navigate('/')">← home</button></div>`;
+      renderSidebar(communities, community);
+      return `
+        <div class="community-banner">
+          <div class="c-icon large">r/</div>
+          <div class="banner-info">
+            <h1>r/${esc(community.name)}</h1>
+            <p>${esc(community.description || 'No description yet.')}</p>
+            <span class="stat">${community.post_count} post${community.post_count !== 1 ? 's' : ''}</span>
+          </div>
+          ${currentUser ? `<button class="btn-pill" onclick="navigate('/submit?community=${esc(community.name)}')">+ New Post</button>` : ''}
+        </div>
+        <div class="feed-header">
+          <span class="feed-title">Posts</span>
+          <div class="sort-tabs">
+            <button class="sort-tab active" onclick="setCommunitySort('top', '${esc(params.name)}', event)">Top</button>
+            <button class="sort-tab" onclick="setCommunitySort('new', '${esc(params.name)}', event)">New</button>
+          </div>
+        </div>
+        <div id="post-list">${renderPostList(posts)}</div>`;
+    });
+
+    page('/post/:id', async ({ params }) => {
+      const [post, comments, communities] = await Promise.all([
+        fetch('/api/posts/' + params.id).then(r => r.json()),
+        fetch('/api/comments?post_id=' + params.id).then(r => r.json()),
+        fetch('/api/communities').then(r => r.json()),
+      ]);
+      if (post.error) return `<div class="empty"><p>Post not found.</p><button class="btn-pill" onclick="navigate('/')">← home</button></div>`;
+      renderSidebar(communities);
+      return `
+        <div class="post-detail">
+          <div class="vote-col">
+            <button id="vote-up-${post.id}" class="vote-btn ${post.user_vote === 1 ? 'active-up' : ''}" onclick="vote(${post.id}, 1)">▲</button>
+            <span class="score" id="score-${post.id}">${post.score}</span>
+            <button id="vote-dn-${post.id}" class="vote-btn ${post.user_vote === -1 ? 'active-dn' : ''}" onclick="vote(${post.id}, -1)">▼</button>
+          </div>
+          <div class="post-body-col">
+            <div class="post-meta-top">
+              <span class="community-pill" onclick="navigate('/r/${esc(post.community_name)}')">r/${esc(post.community_name)}</span>
+              <span class="dot">·</span>
+              <span class="meta-txt">Posted by u/${esc(post.author)}</span>
+              <span class="dot">·</span>
+              <span class="meta-txt">${relTime(post.created_at)}</span>
+            </div>
+            <h1 class="post-title">${esc(post.title)}</h1>
+            ${post.body ? `<div class="post-content">${esc(post.body)}</div>` : ''}
+            <div class="comment-section">
+              <h3>${comments.length} Comment${comments.length !== 1 ? 's' : ''}</h3>
+              ${currentUser
+                ? `<div class="comment-form">
+                     <textarea id="new-comment" placeholder="What are your thoughts?" rows="4"></textarea>
+                     <div class="form-actions"><button class="btn-pill" onclick="submitComment(${post.id})">Comment</button></div>
+                   </div>`
+                : `<p class="login-prompt"><span class="link" onclick="navigate('/login')">Log in</span> or <span class="link" onclick="navigate('/register')">sign up</span> to comment</p>`}
+              <div id="comment-list">
+                ${comments.length
+                  ? comments.map(c => renderComment(c)).join('')
+                  : '<p class="no-comments">No comments yet. Be the first!</p>'}
+              </div>
+            </div>
+          </div>
+        </div>`;
+    });
+
+    page('/submit', async ({ params, query }) => {
+      if (!currentUser) { navigate('/login'); return ''; }
+      const communities = await fetch('/api/communities').then(r => r.json());
+      const preselect = query.community || '';
+      renderSidebar(communities);
+      return `
+        <div class="form-page">
+          <h2>Create a Post</h2>
+          <div class="form-card">
+            <select id="post-community">
+              <option value="">Choose a community</option>
+              ${communities.map(c => `<option value="${esc(c.name)}" ${c.name === preselect ? 'selected' : ''}>r/${esc(c.name)}</option>`).join('')}
+            </select>
+            <input id="post-title" type="text" placeholder="Title" maxlength="300">
+            <textarea id="post-body" placeholder="Text (optional)" rows="8"></textarea>
+            <div class="form-actions">
+              <button class="btn-ghost" onclick="history.back()">Cancel</button>
+              <button class="btn-pill" onclick="submitPost()">Post</button>
+            </div>
+            <div id="submit-error" class="error-msg hidden"></div>
+          </div>
+        </div>`;
+    });
+
+    page('/create-community', () => {
+      if (!currentUser) { navigate('/login'); return ''; }
+      return `
+        <div class="form-page">
+          <h2>Create a Community</h2>
+          <div class="form-card">
+            <div class="prefix-wrap">
+              <span class="prefix">r/</span>
+              <input id="c-name" type="text" placeholder="community_name" maxlength="50">
+            </div>
+            <textarea id="c-desc" placeholder="Description (optional)" rows="3"></textarea>
+            <div class="form-actions">
+              <button class="btn-ghost" onclick="history.back()">Cancel</button>
+              <button class="btn-pill" onclick="createCommunity()">Create</button>
+            </div>
+            <div id="community-error" class="error-msg hidden"></div>
+          </div>
+        </div>`;
+    });
+
+    page('/search', async ({ params, query }) => {
+      const q = query.q || '';
+      if (document.getElementById('search-input')) document.getElementById('search-input').value = q;
+      if (!q) return `<div class="empty"><p>Enter a search query above.</p></div>`;
+      const [posts, communities] = await Promise.all([
+        fetch('/api/search?q=' + encodeURIComponent(q)).then(r => r.json()),
+        fetch('/api/communities').then(r => r.json()),
+      ]);
+      renderSidebar(communities);
+      return `
+        <div class="feed-header">
+          <span class="feed-title">Results for &ldquo;${esc(q)}&rdquo;</span>
+          <span class="stat">${posts.length} post${posts.length !== 1 ? 's' : ''}</span>
+        </div>
+        ${posts.length ? `<div id="post-list">${renderPostList(posts)}</div>` : '<div class="empty"><p>No posts found.</p></div>'}`;
+    });
+
+    page('/login', () => {
+      if (currentUser) { navigate('/'); return ''; }
+      return `
+        <div class="auth-wrap">
+          <div class="auth-card">
+            <h2>Log in</h2>
+            <div id="auth-error" class="error-msg hidden"></div>
+            <input id="a-email" type="email" placeholder="Email" autofocus>
+            <input id="a-password" type="password" placeholder="Password">
+            <button class="btn-pill full" onclick="login()">Log in</button>
+            <p class="auth-switch">New here? <span class="link" onclick="navigate('/register')">Create account</span></p>
+          </div>
+        </div>`;
+    });
+
+    page('/register', () => {
+      if (currentUser) { navigate('/'); return ''; }
+      return `
+        <div class="auth-wrap">
+          <div class="auth-card">
+            <h2>Create Account</h2>
+            <div id="auth-error" class="error-msg hidden"></div>
+            <input id="a-username" type="text" placeholder="Username" autofocus>
+            <input id="a-email" type="email" placeholder="Email">
+            <input id="a-password" type="password" placeholder="Password (min 6 chars)">
+            <button class="btn-pill full" onclick="register()">Sign up</button>
+            <p class="auth-switch">Already have an account? <span class="link" onclick="navigate('/login')">Log in</span></p>
+          </div>
+        </div>`;
+    });
+
+    // ── render helpers ───────────────────────────────────────────────────────
+
+    function renderPostList(posts) {
+      if (!posts.length) return '<div class="empty"><p>No posts yet. Be the first!</p></div>';
+      return posts.map(p => `
+        <div class="post-row">
+          <div class="vote-col">
+            <button id="vote-up-${p.id}" class="vote-btn ${p.user_vote === 1 ? 'active-up' : ''}" onclick="vote(${p.id}, 1)">▲</button>
+            <span class="score" id="score-${p.id}">${p.score}</span>
+            <button id="vote-dn-${p.id}" class="vote-btn ${p.user_vote === -1 ? 'active-dn' : ''}" onclick="vote(${p.id}, -1)">▼</button>
+          </div>
+          <div class="post-info" onclick="navigate('/post/${p.id}')">
+            <div class="post-meta-top">
+              <span class="community-pill" onclick="event.stopPropagation();navigate('/r/${esc(p.community_name)}')">r/${esc(p.community_name)}</span>
+              <span class="dot">·</span>
+              <span class="meta-txt">u/${esc(p.author)}</span>
+              <span class="dot">·</span>
+              <span class="meta-txt">${relTime(p.created_at)}</span>
+            </div>
+            <h3 class="post-title-sm">${esc(p.title)}</h3>
+            ${p.body ? `<p class="post-snippet">${esc(p.body).slice(0, 200)}${p.body.length > 200 ? '…' : ''}</p>` : ''}
+            <div class="post-actions">
+              <span class="action-link">💬 ${p.comment_count} comment${p.comment_count !== 1 ? 's' : ''}</span>
+            </div>
+          </div>
+        </div>`).join('');
+    }
+
+    function renderComment(c) {
+      return `
+        <div class="comment">
+          <div class="comment-meta">
+            <span class="comment-author">u/${esc(c.author)}</span>
+            <span class="dot">·</span>
+            <span class="meta-txt">${relTime(c.created_at)}</span>
+          </div>
+          <div class="comment-body">${esc(c.body)}</div>
+        </div>`;
+    }
+
+    function renderSidebar(communities, activeCommunity) {
+      const sidebar = document.getElementById('sidebar');
+      if (!sidebar) return;
+      const top = communities.slice(0, 6);
+      sidebar.innerHTML = `
+        ${activeCommunity ? `
+          <div class="sidebar-card">
+            <div class="sidebar-title">About r/${esc(activeCommunity.name)}</div>
+            <p class="sidebar-desc">${esc(activeCommunity.description || 'No description.')}</p>
+            <div class="stat">${activeCommunity.post_count} posts</div>
+            ${currentUser ? `<button class="btn-pill full" onclick="navigate('/submit?community=${esc(activeCommunity.name)}')">+ New Post</button>` : ''}
+          </div>` : ''}
+        <div class="sidebar-card">
+          <div class="sidebar-title">Top Communities</div>
+          ${top.map(c => `
+            <div class="sidebar-row" onclick="navigate('/r/${esc(c.name)}')">
+              <span class="sidebar-pill">r/${esc(c.name)}</span>
+              <span class="stat">${c.post_count}</span>
+            </div>`).join('')}
+          <button class="btn-outline full" onclick="navigate('/communities')">View all</button>
+        </div>
+        <div class="sidebar-card">
+          <div class="sidebar-title">Create</div>
+          ${currentUser
+            ? `<button class="btn-pill full" onclick="navigate('/submit')">+ New Post</button>
+               <button class="btn-outline full" onclick="navigate('/create-community')">+ New Community</button>`
+            : `<p class="sidebar-desc">Join the conversation.</p>
+               <button class="btn-pill full" onclick="navigate('/register')">Sign up</button>
+               <button class="btn-outline full" onclick="navigate('/login')">Log in</button>`}
+        </div>`;
+    }
+
+    // ── actions ──────────────────────────────────────────────────────────────
+
+    async function login() {
+      const email = document.getElementById('a-email').value.trim();
+      const password = document.getElementById('a-password').value;
+      const res = await fetch('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      });
+      const data = await res.json();
+      if (!res.ok) { showError('auth-error', data.error); return; }
+      currentUser = data; renderNav(); navigate('/');
+    }
+
+    async function register() {
+      const username = document.getElementById('a-username').value.trim();
+      const email = document.getElementById('a-email').value.trim();
+      const password = document.getElementById('a-password').value;
+      const res = await fetch('/api/auth/register', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, email, password })
+      });
+      const data = await res.json();
+      if (!res.ok) { showError('auth-error', data.error); return; }
+      currentUser = data; renderNav(); navigate('/');
+    }
+
+    async function submitPost() {
+      const community_name = document.getElementById('post-community').value;
+      const title = document.getElementById('post-title').value.trim();
+      const body = document.getElementById('post-body').value.trim();
+      if (!community_name) { showError('submit-error', 'Choose a community'); return; }
+      if (!title) { showError('submit-error', 'Title is required'); return; }
+      const res = await fetch('/api/posts', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, body, community_name })
+      });
+      if (res.status === 401) { navigate('/login'); return; }
+      const post = await res.json();
+      if (post.error) { showError('submit-error', post.error); return; }
+      navigate('/post/' + post.id);
+    }
+
+    async function createCommunity() {
+      const name = document.getElementById('c-name').value.trim();
+      const description = document.getElementById('c-desc').value.trim();
+      const res = await fetch('/api/communities', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description })
+      });
+      const data = await res.json();
+      if (!res.ok) { showError('community-error', data.error); return; }
+      navigate('/r/' + data.name);
+    }
+
+    async function vote(postId, value) {
+      if (!currentUser) { navigate('/login'); return; }
+      const upBtn = document.getElementById('vote-up-' + postId);
+      const downBtn = document.getElementById('vote-dn-' + postId);
+      const current = upBtn && upBtn.classList.contains('active-up') ? 1
+                    : downBtn && downBtn.classList.contains('active-dn') ? -1 : 0;
+      const newValue = current === value ? 0 : value;
+      const res = await fetch('/api/vote', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ post_id: postId, value: newValue })
+      });
+      const data = await res.json();
+      const scoreEl = document.getElementById('score-' + postId);
+      if (scoreEl) scoreEl.textContent = data.score;
+      if (upBtn) upBtn.classList.toggle('active-up', data.user_vote === 1);
+      if (downBtn) downBtn.classList.toggle('active-dn', data.user_vote === -1);
+    }
+
+    async function submitComment(postId) {
+      const ta = document.getElementById('new-comment');
+      const body = ta.value.trim();
+      if (!body) return;
+      const res = await fetch('/api/comments', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ post_id: postId, body })
+      });
+      if (!res.ok) return;
+      const comment = await res.json();
+      ta.value = '';
+      const noComments = document.querySelector('.no-comments');
+      if (noComments) noComments.remove();
+      document.getElementById('comment-list').insertAdjacentHTML('beforeend', renderComment(comment));
+      const h3 = document.querySelector('.comment-section h3');
+      if (h3) {
+        const n = document.querySelectorAll('.comment').length;
+        h3.textContent = n + ' Comment' + (n !== 1 ? 's' : '');
+      }
+    }
+
+    async function setSort(sort, e) {
+      const posts = await fetch('/api/posts?sort=' + sort + '&limit=25').then(r => r.json());
+      document.getElementById('post-list').innerHTML = renderPostList(posts);
+      document.querySelectorAll('.sort-tab').forEach(t => t.classList.remove('active'));
+      e.target.classList.add('active');
+    }
+
+    async function setCommunitySort(sort, name, e) {
+      const posts = await fetch('/api/posts?community=' + name + '&sort=' + sort).then(r => r.json());
+      document.getElementById('post-list').innerHTML = renderPostList(posts);
+      document.querySelectorAll('.sort-tab').forEach(t => t.classList.remove('active'));
+      e.target.classList.add('active');
+    }
+
+    function showError(id, msg) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = msg;
+      el.classList.remove('hidden');
+    }
+
+    // ── utils ────────────────────────────────────────────────────────────────
+
+    function esc(str) {
+      return String(str)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function relTime(dt) {
+      const m = Math.floor((Date.now() - new Date(dt).getTime()) / 60000);
+      if (m < 1) return 'just now';
+      if (m < 60) return m + 'm ago';
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + 'h ago';
+      const d = Math.floor(h / 24);
+      if (d < 30) return d + 'd ago';
+      return Math.floor(d / 30) + 'mo ago';
+    }
+
+    // ── boot ─────────────────────────────────────────────────────────────────
+    loadUser();
+
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      if (document.getElementById('a-password')) {
+        if (document.getElementById('a-username')) register();
+        else login();
+      }
+    });
+  </script>
+</body>
+</html>
+</client>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #dae0e6; color: #1c1c1c; min-height: 100vh; }
+
+  /* header */
+  header { display: flex; align-items: center; gap: 12px; padding: 0 20px; height: 48px; background: white; border-bottom: 1px solid #edeff1; position: sticky; top: 0; z-index: 100; }
+  .logo { font-size: 1.3rem; font-weight: 900; color: #ff4500; cursor: pointer; flex-shrink: 0; letter-spacing: -0.5px; }
+  .search-form { flex: 1; max-width: 680px; display: flex; }
+  .search-form input { flex: 1; padding: 7px 14px; border: 1px solid #edeff1; border-right: none; border-radius: 20px 0 0 20px; font-size: 0.875rem; outline: none; background: #f6f7f8; }
+  .search-form input:focus { border-color: #0079d3; background: white; }
+  .search-form button { padding: 7px 14px; background: #ff4500; color: white; border: none; border-radius: 0 20px 20px 0; cursor: pointer; font-size: 0.85rem; white-space: nowrap; }
+  .search-form button:hover { background: #e03d00; }
+  #nav { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .nav-user { font-size: 0.82rem; color: #0079d3; font-weight: 700; }
+  .nav-logout { background: none; border: 1px solid #edeff1; color: #878a8c; font-size: 0.82rem; cursor: pointer; padding: 5px 10px; border-radius: 20px; }
+  .nav-logout:hover { border-color: #ff4500; color: #ff4500; }
+  .nav-link { color: #0079d3; font-size: 0.875rem; cursor: pointer; font-weight: 600; }
+
+  /* layout */
+  .layout { max-width: 1200px; margin: 0 auto; padding: 20px 24px; display: flex; gap: 24px; align-items: flex-start; }
+  main { flex: 1; min-width: 0; }
+  aside { width: 312px; flex-shrink: 0; display: flex; flex-direction: column; gap: 16px; }
+  @media (max-width: 960px) { aside { display: none; } }
+
+  /* buttons */
+  .btn-pill { display: inline-block; padding: 6px 14px; background: #ff4500; color: white; border: none; border-radius: 20px; font-size: 0.82rem; font-weight: 700; cursor: pointer; white-space: nowrap; text-align: center; }
+  .btn-pill:hover { background: #e03d00; }
+  .btn-outline { display: inline-block; padding: 6px 14px; background: transparent; color: #0079d3; border: 1px solid #0079d3; border-radius: 20px; font-size: 0.82rem; font-weight: 700; cursor: pointer; white-space: nowrap; text-align: center; }
+  .btn-outline:hover { background: #e8f0fe; }
+  .btn-ghost { padding: 8px 16px; background: transparent; border: 1px solid #edeff1; border-radius: 20px; font-size: 0.875rem; cursor: pointer; color: #1c1c1c; }
+  .btn-ghost:hover { border-color: #999; }
+  .full { width: 100%; }
+  .link { color: #0079d3; cursor: pointer; font-weight: 600; }
+  .link:hover { text-decoration: underline; }
+
+  /* feed header */
+  .feed-header { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 10px 14px; margin-bottom: 10px; display: flex; align-items: center; gap: 12px; }
+  .feed-title { font-size: 1rem; font-weight: 700; }
+  .sort-tabs { display: flex; gap: 2px; }
+  .sort-tab { padding: 5px 12px; background: transparent; border: none; border-radius: 20px; font-size: 0.875rem; font-weight: 700; cursor: pointer; color: #878a8c; }
+  .sort-tab:hover, .sort-tab.active { background: #e8e8e8; color: #1c1c1c; }
+  .stat { font-size: 0.8rem; color: #878a8c; }
+
+  /* post row */
+  .post-row { display: flex; background: white; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 10px; transition: border-color 0.1s; }
+  .post-row:hover { border-color: #898989; }
+  .vote-col { display: flex; flex-direction: column; align-items: center; padding: 8px 4px; background: #f8f9fa; border-radius: 4px 0 0 4px; min-width: 40px; gap: 2px; flex-shrink: 0; }
+  .vote-btn { background: none; border: none; cursor: pointer; color: #878a8c; font-size: 1rem; padding: 2px 4px; border-radius: 2px; line-height: 1; }
+  .vote-btn:hover { color: #ff4500; }
+  .active-up { color: #ff4500 !important; }
+  .active-dn { color: #7193ff !important; }
+  .score { font-size: 0.78rem; font-weight: 700; color: #1c1c1c; text-align: center; min-width: 20px; }
+  .post-info { flex: 1; padding: 8px 10px; cursor: pointer; min-width: 0; }
+  .post-meta-top { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+  .community-pill { font-size: 0.75rem; font-weight: 700; color: #0079d3; cursor: pointer; }
+  .community-pill:hover { text-decoration: underline; }
+  .dot { color: #ccc; font-size: 0.75rem; }
+  .meta-txt { font-size: 0.75rem; color: #878a8c; }
+  .post-title-sm { font-size: 1rem; font-weight: 500; margin-bottom: 4px; line-height: 1.3; }
+  .post-snippet { font-size: 0.875rem; color: #3c3c3c; line-height: 1.5; margin-bottom: 6px; }
+  .post-actions { display: flex; gap: 4px; }
+  .action-link { font-size: 0.75rem; color: #878a8c; font-weight: 700; padding: 4px 6px; border-radius: 2px; }
+  .action-link:hover { background: #e8e8e8; }
+
+  /* post detail */
+  .post-detail { display: flex; background: white; border: 1px solid #ccc; border-radius: 4px; }
+  .post-detail .vote-col { border-radius: 4px 0 0 4px; }
+  .post-body-col { flex: 1; padding: 16px; min-width: 0; }
+  .post-title { font-size: 1.4rem; font-weight: 500; margin: 8px 0 12px; line-height: 1.3; }
+  .post-content { font-size: 0.95rem; line-height: 1.75; color: #333; white-space: pre-wrap; padding: 12px 0; border-top: 1px solid #edeff1; margin-bottom: 12px; }
+
+  /* comments */
+  .comment-section { border-top: 1px solid #edeff1; padding-top: 16px; margin-top: 4px; }
+  .comment-section h3 { font-size: 0.9rem; font-weight: 700; color: #878a8c; margin-bottom: 14px; }
+  .comment-form { margin-bottom: 20px; }
+  .comment-form textarea { width: 100%; padding: 10px 12px; border: 1px solid #edeff1; border-radius: 4px; font-size: 0.9rem; font-family: inherit; resize: vertical; outline: none; margin-bottom: 8px; }
+  .comment-form textarea:focus { border-color: #0079d3; }
+  .login-prompt { font-size: 0.875rem; color: #878a8c; padding: 12px; background: #f6f7f8; border-radius: 4px; margin-bottom: 16px; }
+  .comment { padding: 10px 0; border-bottom: 1px solid #f0f0f0; }
+  .comment:last-child { border-bottom: none; }
+  .comment-meta { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
+  .comment-author { font-size: 0.8rem; font-weight: 700; color: #0079d3; }
+  .comment-body { font-size: 0.9rem; line-height: 1.65; white-space: pre-wrap; }
+  .no-comments { color: #878a8c; font-size: 0.9rem; text-align: center; padding: 24px 0; }
+
+  /* community banner */
+  .community-banner { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 20px; margin-bottom: 12px; display: flex; align-items: center; gap: 16px; }
+  .c-icon { width: 40px; height: 40px; background: #ff4500; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: 900; font-size: 0.85rem; flex-shrink: 0; }
+  .c-icon.large { width: 52px; height: 52px; font-size: 1rem; }
+  .banner-info { flex: 1; }
+  .banner-info h1 { font-size: 1.4rem; font-weight: 700; }
+  .banner-info p { color: #878a8c; font-size: 0.875rem; margin-top: 4px; }
+
+  /* community grid */
+  .community-grid { display: flex; flex-direction: column; gap: 8px; }
+  .community-card { display: flex; gap: 14px; background: white; border: 1px solid #ccc; border-radius: 4px; padding: 14px; cursor: pointer; transition: border-color 0.1s; align-items: center; }
+  .community-card:hover { border-color: #0079d3; }
+  .c-info { flex: 1; }
+  .c-info strong { display: block; font-size: 0.95rem; margin-bottom: 2px; }
+  .c-info p { font-size: 0.85rem; color: #878a8c; margin-bottom: 4px; }
+
+  /* sidebar */
+  .sidebar-card { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .sidebar-title { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #1c1c1c; }
+  .sidebar-desc { font-size: 0.85rem; color: #878a8c; line-height: 1.5; }
+  .sidebar-row { display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 3px 0; }
+  .sidebar-row:hover .sidebar-pill { text-decoration: underline; }
+  .sidebar-pill { font-size: 0.85rem; color: #0079d3; font-weight: 600; }
+
+  /* forms */
+  .form-page { max-width: 740px; }
+  .form-page h2 { font-size: 1.2rem; font-weight: 700; margin-bottom: 12px; }
+  .form-card { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  input, textarea, select { width: 100%; padding: 9px 12px; border: 1px solid #edeff1; border-radius: 4px; font-size: 0.9rem; font-family: inherit; outline: none; background: white; }
+  input:focus, textarea:focus, select:focus { border-color: #0079d3; }
+  textarea { resize: vertical; line-height: 1.6; }
+  select { appearance: auto; }
+  .prefix-wrap { display: flex; align-items: center; border: 1px solid #edeff1; border-radius: 4px; overflow: hidden; }
+  .prefix-wrap:focus-within { border-color: #0079d3; }
+  .prefix { padding: 9px 10px; background: #f6f7f8; border-right: 1px solid #edeff1; font-size: 0.9rem; color: #878a8c; white-space: nowrap; }
+  .prefix-wrap input { border: none; border-radius: 0; }
+  .prefix-wrap input:focus { border: none; }
+  .form-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .error-msg { padding: 10px 14px; background: #fff0f0; border: 1px solid #fcc; border-radius: 4px; color: #c00; font-size: 0.85rem; }
+  .error-msg.hidden { display: none; }
+
+  /* auth */
+  .auth-wrap { display: flex; justify-content: center; padding: 40px 0; }
+  .auth-card { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 32px; width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 12px; }
+  .auth-card h2 { font-size: 1.25rem; font-weight: 700; }
+  .auth-switch { font-size: 0.85rem; color: #878a8c; text-align: center; }
+
+  /* empty */
+  .empty { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 60px 20px; text-align: center; color: #878a8c; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+</style>

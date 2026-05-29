@@ -1,5 +1,27 @@
 {
+  "name": "autohtml-cli",
+  "version": "1.0.0",
+  "description": "One file. Full stack. Double-click to run.",
+  "bin": {
+    "ahtml": "./bin/ahtml.js",
+    "autohtml": "./bin/ahtml.js"
+  },
+  "files": [
+    "bin/",
+    "src/"
+  ],
+  "keywords": ["ahtml", "fullstack", "sqlite", "cli", "developer-tools"],
+  "author": "Andre Schoolman",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Winnrman/autohtml"
+  },
   "dependencies": {
+    "socket.io": "^4.8.1",
     "sql.js": "^1.14.1"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

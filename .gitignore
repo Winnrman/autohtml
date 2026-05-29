@@ -5,5 +5,8 @@ main.html
 # dependencies
 node_modules/
 
+# python virtualenvs created for <server lang="python"> deps
+.*-venv/
+
 # temp files
 *.tmp

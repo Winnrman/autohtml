@@ -1,0 +1,215 @@
+<db type="sqlite">
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+</db>
+
+<server lang="node">
+app.get('/api/messages', (req, res) => {
+  res.json(db.query('SELECT * FROM messages ORDER BY created_at ASC'));
+});
+</server>
+
+<io>
+let online = 0;
+
+io.on('connection', socket => {
+  online++;
+  io.emit('online', online);
+
+  socket.on('join', username => {
+    socket.username = username;
+    io.emit('system', { text: username + ' joined' });
+  });
+
+  socket.on('message', ({ username, body }) => {
+    if (!body || !body.trim()) return;
+    db.run('INSERT INTO messages (username, body) VALUES (?, ?)', [username, body.trim()]);
+    const msg = db.get('SELECT * FROM messages ORDER BY id DESC LIMIT 1');
+    io.emit('message', msg);
+  });
+
+  socket.on('disconnect', () => {
+    online--;
+    io.emit('online', online);
+    if (socket.username) {
+      io.emit('system', { text: socket.username + ' left' });
+    }
+  });
+});
+</io>
+
+<client>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>chat</title>
+</head>
+<body>
+
+  <!-- Intro screen -->
+  <div id="intro">
+    <div class="intro-card">
+      <h1>chat</h1>
+      <p>what's your name?</p>
+      <input id="name-input" type="text" placeholder="enter a name..." maxlength="24" autocomplete="off" />
+      <button onclick="joinChat()">join</button>
+    </div>
+  </div>
+
+  <!-- Chat screen -->
+  <div id="chat" class="hidden">
+    <div class="header">
+      <span class="header-title">chat</span>
+      <span id="online-badge">1 online</span>
+    </div>
+    <div id="messages"></div>
+    <div class="input-row">
+      <input id="msg-input" type="text" placeholder="say something..." autocomplete="off" maxlength="500" />
+      <button onclick="sendMessage()">send</button>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    let username = '';
+    const socket = io();
+
+    function joinChat() {
+      const val = document.getElementById('name-input').value.trim();
+      if (!val) return;
+      username = val;
+
+      // Load history then switch screens
+      fetch('/api/messages')
+        .then(r => r.json())
+        .then(history => {
+          history.forEach(m => appendMessage(m));
+          document.getElementById('intro').classList.add('hidden');
+          document.getElementById('chat').classList.remove('hidden');
+          document.getElementById('msg-input').focus();
+          scrollToBottom();
+          socket.emit('join', username);
+        });
+    }
+
+    function sendMessage() {
+      const input = document.getElementById('msg-input');
+      const body = input.value.trim();
+      if (!body) return;
+      socket.emit('message', { username, body });
+      input.value = '';
+    }
+
+    function appendMessage(msg) {
+      const wrap = document.createElement('div');
+      const isMe = msg.username === username;
+      wrap.className = 'msg' + (isMe ? ' me' : '');
+
+      const time = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      wrap.innerHTML =
+        '<div class="bubble">' +
+          '<span class="who">' + esc(msg.username) + '</span>' +
+          '<span class="text">' + esc(msg.body) + '</span>' +
+          '<span class="time">' + time + '</span>' +
+        '</div>';
+
+      document.getElementById('messages').appendChild(wrap);
+      scrollToBottom();
+    }
+
+    function appendSystem(text) {
+      const el = document.createElement('div');
+      el.className = 'system-msg';
+      el.textContent = text;
+      document.getElementById('messages').appendChild(el);
+      scrollToBottom();
+    }
+
+    function scrollToBottom() {
+      const el = document.getElementById('messages');
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function esc(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    socket.on('message', msg => {
+      if (username) appendMessage(msg);
+    });
+
+    socket.on('system', ({ text }) => {
+      if (username) appendSystem(text);
+    });
+
+    socket.on('online', count => {
+      document.getElementById('online-badge').textContent =
+        count + (count === 1 ? ' online' : ' online');
+    });
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        if (!username) joinChat();
+        else sendMessage();
+      }
+    });
+  </script>
+</body>
+</html>
+</client>
+
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0f0f0f; height: 100vh; overflow: hidden; color: #e8e8e8; }
+
+/* Intro */
+#intro { height: 100vh; display: flex; align-items: center; justify-content: center; }
+#intro.hidden { display: none; }
+.intro-card { display: flex; flex-direction: column; align-items: center; gap: 16px; width: 320px; }
+.intro-card h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.03em; color: #fff; }
+.intro-card p { color: #666; font-size: 0.95rem; }
+.intro-card input { width: 100%; padding: 12px 16px; background: #1a1a1a; border: 1.5px solid #2a2a2a; border-radius: 10px; font-size: 1rem; color: #fff; outline: none; text-align: center; }
+.intro-card input:focus { border-color: #4f8ef7; }
+.intro-card button { width: 100%; padding: 12px; background: #4f8ef7; color: #fff; border: none; border-radius: 10px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+.intro-card button:hover { background: #3a7ae0; }
+
+/* Chat layout */
+#chat { display: flex; flex-direction: column; height: 100vh; max-width: 680px; margin: 0 auto; }
+#chat.hidden { display: none; }
+
+.header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid #1e1e1e; flex-shrink: 0; }
+.header-title { font-size: 1rem; font-weight: 600; color: #fff; }
+#online-badge { font-size: 0.8rem; color: #4f8ef7; background: rgba(79,142,247,0.12); padding: 3px 10px; border-radius: 99px; }
+
+#messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 6px; }
+#messages::-webkit-scrollbar { width: 4px; }
+#messages::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+.msg { display: flex; }
+.msg.me { justify-content: flex-end; }
+
+.bubble { display: flex; flex-direction: column; gap: 3px; max-width: 72%; background: #1a1a1a; border-radius: 14px; padding: 10px 14px; }
+.me .bubble { background: #1e3a5f; border-bottom-right-radius: 4px; }
+.msg:not(.me) .bubble { border-bottom-left-radius: 4px; }
+
+.who { font-size: 0.72rem; font-weight: 600; color: #4f8ef7; }
+.me .who { color: #7fb3ff; }
+.text { font-size: 0.95rem; line-height: 1.5; color: #e8e8e8; word-break: break-word; }
+.time { font-size: 0.68rem; color: #555; align-self: flex-end; margin-top: 2px; }
+
+.system-msg { text-align: center; font-size: 0.75rem; color: #444; padding: 4px 0; }
+
+.input-row { display: flex; gap: 8px; padding: 16px 20px; border-top: 1px solid #1e1e1e; flex-shrink: 0; }
+.input-row input { flex: 1; padding: 12px 16px; background: #1a1a1a; border: 1.5px solid #2a2a2a; border-radius: 10px; font-size: 0.95rem; color: #fff; outline: none; }
+.input-row input:focus { border-color: #4f8ef7; }
+.input-row button { padding: 12px 20px; background: #4f8ef7; color: #fff; border: none; border-radius: 10px; font-size: 0.95rem; font-weight: 600; cursor: pointer; }
+.input-row button:hover { background: #3a7ae0; }
+</style>

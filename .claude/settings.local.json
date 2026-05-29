@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node test/test.js)",
+      "Bash(py --version)",
+      "Bash(node bin/ahtml.js test/python-notes.ahtml --no-open --no-watch)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3001/api/notes)",
+      "Bash(curl -s -w \" [%{http_code}]\" http://localhost:3001/api/nope)",
+      "Bash(curl -s http://localhost:3000/api/notes)",
+      "Bash(ls -la test/python-notes.db)",
+      "Bash(node bin/ahtml.js test/python-deps.ahtml --no-open --no-watch)",
+      "Bash(node bin/ahtml.js test/todo.ahtml --no-open --no-watch)",
+      "Bash(curl -s http://localhost:3000/api/todos)",
+      "Bash(node -e ' *)",
+      "Bash(export VAULT_DIR=\"C:\\\\Users\\\\hackr\\\\Documents\\\\Code\\\\Code - 2026\\\\03 - March\\\\ahtml\\\\test\\\\_tmpvault\")",
+      "Bash(node bin/ahtml.js test/vault-search.ahtml --no-open --no-watch)"
+    ]
+  }
+}

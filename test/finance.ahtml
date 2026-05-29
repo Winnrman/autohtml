@@ -1,0 +1,515 @@
+<db type="sqlite">
+  CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    description TEXT NOT NULL,
+    amount REAL NOT NULL,
+    category TEXT NOT NULL DEFAULT 'Other',
+    type TEXT NOT NULL DEFAULT 'expense',
+    date TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS goals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    target_amount REAL NOT NULL,
+    current_amount REAL NOT NULL DEFAULT 0,
+    deadline TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+</db>
+
+<server lang="node">
+app.get('/api/transactions', (req, res) => {
+  const rows = db.query('SELECT * FROM transactions ORDER BY date DESC, created_at DESC');
+  res.json(rows);
+});
+
+app.post('/api/transactions', (req, res) => {
+  const { description, amount, category, type, date } = req.body;
+  if (!description || !amount || !date) {
+    res.status(400).json({ error: 'description, amount, and date required' });
+    return;
+  }
+  const result = db.run(
+    'INSERT INTO transactions (description, amount, category, type, date) VALUES (?, ?, ?, ?, ?)',
+    [description, Math.abs(parseFloat(amount)), category || 'Other', type || 'expense', date]
+  );
+  res.json(db.get('SELECT * FROM transactions WHERE id = ?', [result.lastInsertRowid]));
+});
+
+app.delete('/api/transactions', (req, res) => {
+  db.run('DELETE FROM transactions WHERE id = ?', [req.body.id]);
+  res.json({ ok: true });
+});
+
+app.get('/api/goals', (req, res) => {
+  res.json(db.query('SELECT * FROM goals ORDER BY created_at DESC'));
+});
+
+app.post('/api/goals', (req, res) => {
+  const { name, target_amount, current_amount, deadline } = req.body;
+  if (!name || !target_amount) {
+    res.status(400).json({ error: 'name and target_amount required' });
+    return;
+  }
+  const result = db.run(
+    'INSERT INTO goals (name, target_amount, current_amount, deadline) VALUES (?, ?, ?, ?)',
+    [name, parseFloat(target_amount), parseFloat(current_amount) || 0, deadline || null]
+  );
+  res.json(db.get('SELECT * FROM goals WHERE id = ?', [result.lastInsertRowid]));
+});
+
+app.put('/api/goals', (req, res) => {
+  const { id, current_amount } = req.body;
+  db.run('UPDATE goals SET current_amount = ? WHERE id = ?', [parseFloat(current_amount), id]);
+  res.json(db.get('SELECT * FROM goals WHERE id = ?', [id]));
+});
+
+app.delete('/api/goals', (req, res) => {
+  db.run('DELETE FROM goals WHERE id = ?', [req.body.id]);
+  res.json({ ok: true });
+});
+
+app.get('/api/summary', (req, res) => {
+  const totals = db.query('SELECT type, SUM(amount) as total FROM transactions GROUP BY type');
+  const byCategory = db.query(
+    'SELECT category, type, SUM(amount) as total FROM transactions GROUP BY category, type ORDER BY total DESC'
+  );
+  res.json({ totals, byCategory });
+});
+</server>
+
+<client>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>finance tracker</title>
+</head>
+<body>
+  <div class="app">
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <h2>finance</h2>
+      </div>
+      <nav>
+        <button class="nav-btn active" data-view="dashboard" onclick="switchView('dashboard')">&#9632; dashboard</button>
+        <button class="nav-btn" data-view="transactions" onclick="switchView('transactions')">&#8645; transactions</button>
+        <button class="nav-btn" data-view="goals" onclick="switchView('goals')">&#9711; goals</button>
+      </nav>
+    </div>
+
+    <div class="main">
+
+      <!-- DASHBOARD -->
+      <div id="view-dashboard" class="view">
+        <div class="view-header"><h1>dashboard</h1></div>
+        <div class="stat-cards">
+          <div class="stat-card">
+            <div class="stat-label">net balance</div>
+            <div class="stat-value" id="stat-balance">$0.00</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">total income</div>
+            <div class="stat-value income" id="stat-income">$0.00</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">total expenses</div>
+            <div class="stat-value expense" id="stat-expenses">$0.00</div>
+          </div>
+        </div>
+        <div class="panels">
+          <div class="panel">
+            <h3>spending by category</h3>
+            <div id="category-list"></div>
+          </div>
+          <div class="panel">
+            <h3>recent transactions</h3>
+            <div id="recent-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TRANSACTIONS -->
+      <div id="view-transactions" class="view hidden">
+        <div class="view-header">
+          <h1>transactions</h1>
+          <button class="add-btn" onclick="toggleTxForm()">+ add</button>
+        </div>
+        <div id="tx-form" class="form-card hidden">
+          <div class="form-row">
+            <input id="tx-desc" type="text" placeholder="description">
+            <input id="tx-amount" type="number" min="0" step="0.01" placeholder="amount">
+          </div>
+          <div class="form-row">
+            <select id="tx-type" onchange="updateTxCategories()">
+              <option value="expense">expense</option>
+              <option value="income">income</option>
+            </select>
+            <select id="tx-category"></select>
+            <input id="tx-date" type="date">
+          </div>
+          <div class="form-actions">
+            <button class="cancel-btn" onclick="toggleTxForm()">cancel</button>
+            <button class="save-btn" onclick="addTransaction()">save</button>
+          </div>
+        </div>
+        <div class="filter-bar">
+          <select id="filter-type" onchange="renderTransactions()">
+            <option value="all">all types</option>
+            <option value="income">income</option>
+            <option value="expense">expense</option>
+          </select>
+          <select id="filter-category" onchange="renderTransactions()">
+            <option value="all">all categories</option>
+          </select>
+        </div>
+        <div id="tx-list"></div>
+      </div>
+
+      <!-- GOALS -->
+      <div id="view-goals" class="view hidden">
+        <div class="view-header">
+          <h1>goals</h1>
+          <button class="add-btn" onclick="toggleGoalForm()">+ add</button>
+        </div>
+        <div id="goal-form" class="form-card hidden">
+          <div class="form-row">
+            <input id="goal-name" type="text" placeholder="goal name">
+            <input id="goal-target" type="number" min="0" step="0.01" placeholder="target amount">
+          </div>
+          <div class="form-row">
+            <input id="goal-saved" type="number" min="0" step="0.01" placeholder="already saved (optional)">
+            <input id="goal-deadline" type="date">
+          </div>
+          <div class="form-actions">
+            <button class="cancel-btn" onclick="toggleGoalForm()">cancel</button>
+            <button class="save-btn" onclick="addGoal()">save</button>
+          </div>
+        </div>
+        <div id="goals-list"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const EXPENSE_CATS = ['Food', 'Transport', 'Housing', 'Healthcare', 'Entertainment', 'Shopping', 'Education', 'Other'];
+    const INCOME_CATS  = ['Salary', 'Freelance', 'Investment', 'Gift', 'Other'];
+
+    let transactions = [], goals = [], summary = {};
+    let currentView = 'dashboard';
+
+    async function loadAll() {
+      [transactions, goals, summary] = await Promise.all([
+        fetch('/api/transactions').then(r => r.json()),
+        fetch('/api/goals').then(r => r.json()),
+        fetch('/api/summary').then(r => r.json()),
+      ]);
+      renderDashboard();
+      if (currentView === 'transactions') { renderTransactions(); populateCategoryFilter(); }
+      if (currentView === 'goals') renderGoals();
+    }
+
+    function fmt(n) {
+      return '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function switchView(view) {
+      currentView = view;
+      document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
+      document.getElementById('view-' + view).classList.remove('hidden');
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      document.querySelector(`[data-view="${view}"]`).classList.add('active');
+      if (view === 'transactions') { updateTxCategories(); populateCategoryFilter(); renderTransactions(); }
+      if (view === 'goals') renderGoals();
+    }
+
+    function renderDashboard() {
+      const income  = (summary.totals || []).find(t => t.type === 'income')?.total || 0;
+      const expense = (summary.totals || []).find(t => t.type === 'expense')?.total || 0;
+      const balance = income - expense;
+
+      const balEl = document.getElementById('stat-balance');
+      balEl.textContent = (balance < 0 ? '-' : '') + fmt(balance);
+      balEl.className = 'stat-value ' + (balance < 0 ? 'expense' : 'income');
+      document.getElementById('stat-income').textContent = fmt(income);
+      document.getElementById('stat-expenses').textContent = fmt(expense);
+
+      const expCats = (summary.byCategory || []).filter(c => c.type === 'expense');
+      const totalExp = expCats.reduce((s, c) => s + c.total, 0) || 1;
+      document.getElementById('category-list').innerHTML = expCats.length
+        ? expCats.map(c => `
+            <div class="cat-row">
+              <span class="cat-name">${esc(c.category)}</span>
+              <div class="cat-bar-wrap"><div class="cat-bar" style="width:${(c.total / totalExp * 100).toFixed(1)}%"></div></div>
+              <span class="cat-amt">${fmt(c.total)}</span>
+            </div>`).join('')
+        : '<p class="empty">no spending yet</p>';
+
+      document.getElementById('recent-list').innerHTML = transactions.slice(0, 6).map(t => `
+        <div class="recent-tx">
+          <div>
+            <div class="tx-desc">${esc(t.description)}</div>
+            <div class="tx-meta">${esc(t.category)} &middot; ${t.date}</div>
+          </div>
+          <span class="tx-amt ${t.type}">${t.type === 'expense' ? '-' : '+'}${fmt(t.amount)}</span>
+        </div>`).join('') || '<p class="empty">no transactions yet</p>';
+    }
+
+    function updateTxCategories() {
+      const type = document.getElementById('tx-type').value;
+      document.getElementById('tx-category').innerHTML =
+        (type === 'income' ? INCOME_CATS : EXPENSE_CATS).map(c => `<option>${c}</option>`).join('');
+    }
+
+    function populateCategoryFilter() {
+      const cats = [...new Set(transactions.map(t => t.category))];
+      const sel = document.getElementById('filter-category');
+      const cur = sel.value;
+      sel.innerHTML = '<option value="all">all categories</option>' +
+        cats.map(c => `<option ${c === cur ? 'selected' : ''}>${c}</option>`).join('');
+    }
+
+    function renderTransactions() {
+      const typeF = document.getElementById('filter-type').value;
+      const catF  = document.getElementById('filter-category').value;
+      let list = transactions;
+      if (typeF !== 'all') list = list.filter(t => t.type === typeF);
+      if (catF  !== 'all') list = list.filter(t => t.category === catF);
+      document.getElementById('tx-list').innerHTML = list.length
+        ? list.map(t => `
+          <div class="tx-row">
+            <div class="tx-info">
+              <span class="tx-desc">${esc(t.description)}</span>
+              <span class="tx-meta">${esc(t.category)} &middot; ${t.date}</span>
+            </div>
+            <span class="tx-amt ${t.type}">${t.type === 'expense' ? '-' : '+'}${fmt(t.amount)}</span>
+            <button class="del-btn" onclick="deleteTransaction(${t.id})">&#215;</button>
+          </div>`).join('')
+        : '<p class="empty">no transactions found</p>';
+    }
+
+    function toggleTxForm() {
+      const f = document.getElementById('tx-form');
+      f.classList.toggle('hidden');
+      if (!f.classList.contains('hidden')) {
+        updateTxCategories();
+        document.getElementById('tx-date').value = new Date().toISOString().slice(0, 10);
+        document.getElementById('tx-desc').focus();
+      }
+    }
+
+    async function addTransaction() {
+      const desc     = document.getElementById('tx-desc').value.trim();
+      const amount   = document.getElementById('tx-amount').value;
+      const type     = document.getElementById('tx-type').value;
+      const category = document.getElementById('tx-category').value;
+      const date     = document.getElementById('tx-date').value;
+      if (!desc || !amount || !date) return;
+      await fetch('/api/transactions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: desc, amount, type, category, date })
+      });
+      document.getElementById('tx-desc').value = '';
+      document.getElementById('tx-amount').value = '';
+      toggleTxForm();
+      await loadAll();
+      populateCategoryFilter();
+    }
+
+    async function deleteTransaction(id) {
+      await fetch('/api/transactions', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      loadAll();
+    }
+
+    function renderGoals() {
+      document.getElementById('goals-list').innerHTML = goals.length
+        ? goals.map(g => {
+            const pct  = Math.min(100, (g.current_amount / g.target_amount) * 100).toFixed(1);
+            const done = g.current_amount >= g.target_amount;
+            return `
+            <div class="goal-card${done ? ' done' : ''}">
+              <div class="goal-header">
+                <span class="goal-name">${esc(g.name)}</span>
+                <button class="del-btn" onclick="deleteGoal(${g.id})">&#215;</button>
+              </div>
+              <div class="goal-amounts">
+                <span class="income">${fmt(g.current_amount)} saved</span>
+                <span class="muted">of ${fmt(g.target_amount)}</span>
+              </div>
+              <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+              <div class="goal-footer">
+                <span class="pct-label">${pct}%${done ? ' &check; complete' : ''}</span>
+                ${g.deadline ? `<span class="muted">by ${g.deadline}</span>` : ''}
+              </div>
+              ${!done ? `
+              <div class="goal-add-row">
+                <input type="number" min="0" step="0.01" placeholder="add savings" id="gadd-${g.id}">
+                <button class="save-btn small" onclick="addToGoal(${g.id})">add</button>
+              </div>` : ''}
+            </div>`;
+          }).join('')
+        : '<p class="empty">no goals yet &mdash; add one to get started</p>';
+    }
+
+    function toggleGoalForm() {
+      document.getElementById('goal-form').classList.toggle('hidden');
+    }
+
+    async function addGoal() {
+      const name     = document.getElementById('goal-name').value.trim();
+      const target   = document.getElementById('goal-target').value;
+      const saved    = document.getElementById('goal-saved').value || '0';
+      const deadline = document.getElementById('goal-deadline').value;
+      if (!name || !target) return;
+      await fetch('/api/goals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, target_amount: target, current_amount: saved, deadline: deadline || null })
+      });
+      ['goal-name','goal-target','goal-saved','goal-deadline'].forEach(id => document.getElementById(id).value = '');
+      toggleGoalForm();
+      await loadAll();
+    }
+
+    async function deleteGoal(id) {
+      await fetch('/api/goals', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      loadAll();
+    }
+
+    async function addToGoal(id) {
+      const input = document.getElementById('gadd-' + id);
+      const amount = parseFloat(input.value);
+      if (!amount || amount <= 0) return;
+      const goal = goals.find(g => g.id === id);
+      await fetch('/api/goals', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, current_amount: (goal.current_amount || 0) + amount })
+      });
+      input.value = '';
+      loadAll();
+    }
+
+    updateTxCategories();
+    loadAll();
+  </script>
+</body>
+</html>
+</client>
+
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #f5f5f0; height: 100vh; overflow: hidden; }
+.app { display: flex; height: 100vh; }
+
+/* Sidebar */
+.sidebar { width: 200px; background: #1a1a1a; display: flex; flex-direction: column; flex-shrink: 0; }
+.sidebar-header { padding: 20px 16px; border-bottom: 1px solid #2a2a2a; }
+.sidebar-header h2 { color: #fff; font-size: 1rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+nav { padding: 10px 8px; display: flex; flex-direction: column; gap: 2px; }
+.nav-btn { width: 100%; text-align: left; padding: 10px 12px; background: none; border: none; border-radius: 8px; color: #888; font-size: 0.9rem; cursor: pointer; transition: background 0.15s, color 0.15s; }
+.nav-btn:hover { background: #2a2a2a; color: #fff; }
+.nav-btn.active { background: #10b981; color: #fff; }
+
+/* Main area */
+.main { flex: 1; overflow-y: auto; padding: 32px; }
+.view.hidden { display: none; }
+.view-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+.view-header h1 { font-size: 1.8rem; font-weight: 700; color: #1a1a1a; }
+.add-btn { padding: 8px 16px; background: #10b981; color: white; border: none; border-radius: 8px; font-size: 0.9rem; cursor: pointer; }
+.add-btn:hover { background: #059669; }
+
+/* Stat cards */
+.stat-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 28px; }
+.stat-card { background: white; border-radius: 12px; padding: 20px 24px; border: 1.5px solid #eee; }
+.stat-label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: #999; margin-bottom: 8px; }
+.stat-value { font-size: 1.6rem; font-weight: 700; color: #1a1a1a; }
+.stat-value.income { color: #10b981; }
+.stat-value.expense { color: #ef4444; }
+
+/* Panels */
+.panels { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.panel { background: white; border-radius: 12px; padding: 20px; border: 1.5px solid #eee; }
+.panel h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: #999; margin-bottom: 16px; }
+
+/* Category bars */
+.cat-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.cat-name { font-size: 0.85rem; color: #444; width: 90px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cat-bar-wrap { flex: 1; height: 8px; background: #f0f0f0; border-radius: 99px; overflow: hidden; }
+.cat-bar { height: 100%; background: #10b981; border-radius: 99px; transition: width 0.4s; }
+.cat-amt { font-size: 0.82rem; color: #666; width: 70px; text-align: right; flex-shrink: 0; }
+
+/* Recent list */
+.recent-tx { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #f0f0f0; }
+.recent-tx:last-child { border-bottom: none; }
+
+/* Transaction list */
+.tx-row { display: flex; align-items: center; gap: 12px; background: white; border-radius: 10px; border: 1.5px solid #eee; padding: 12px 16px; margin-bottom: 8px; }
+.tx-info { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.tx-desc { font-size: 0.95rem; font-weight: 500; color: #1a1a1a; }
+.tx-meta { font-size: 0.78rem; color: #999; }
+.tx-amt { font-size: 0.95rem; font-weight: 600; white-space: nowrap; }
+.tx-amt.income { color: #10b981; }
+.tx-amt.expense { color: #ef4444; }
+
+/* Goals */
+.goals-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+.goal-card { background: white; border-radius: 12px; border: 1.5px solid #eee; padding: 20px; }
+.goal-card.done { border-color: #10b981; }
+.goal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.goal-name { font-size: 1rem; font-weight: 600; color: #1a1a1a; }
+.goal-amounts { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 8px; }
+.progress-bar { height: 8px; background: #f0f0f0; border-radius: 99px; overflow: hidden; margin-bottom: 8px; }
+.progress-fill { height: 100%; background: #10b981; border-radius: 99px; transition: width 0.4s; }
+.goal-footer { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 12px; }
+.pct-label { color: #10b981; font-weight: 600; }
+.goal-add-row { display: flex; gap: 8px; }
+.goal-add-row input { flex: 1; padding: 7px 10px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.85rem; outline: none; }
+.goal-add-row input:focus { border-color: #10b981; }
+
+/* Form */
+.form-card { background: white; border-radius: 12px; border: 1.5px solid #eee; padding: 20px; margin-bottom: 20px; }
+.form-card.hidden { display: none; }
+.form-row { display: flex; gap: 10px; margin-bottom: 12px; }
+.form-row input, .form-row select { flex: 1; padding: 9px 12px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.9rem; outline: none; font-family: inherit; background: white; }
+.form-row input:focus, .form-row select:focus { border-color: #10b981; }
+.form-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.cancel-btn { padding: 8px 16px; border: 1.5px solid #ddd; background: transparent; border-radius: 8px; cursor: pointer; font-size: 0.9rem; }
+.cancel-btn:hover { background: #f5f5f5; }
+.save-btn { padding: 8px 16px; background: #10b981; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 0.9rem; }
+.save-btn:hover { background: #059669; }
+.save-btn.small { padding: 7px 12px; font-size: 0.82rem; }
+
+/* Filter bar */
+.filter-bar { display: flex; gap: 10px; margin-bottom: 16px; }
+.filter-bar select { padding: 8px 12px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.88rem; outline: none; background: white; cursor: pointer; }
+.filter-bar select:focus { border-color: #10b981; }
+
+/* Misc */
+.del-btn { background: none; border: none; color: #bbb; font-size: 1.1rem; cursor: pointer; padding: 0 4px; line-height: 1; }
+.del-btn:hover { color: #ef4444; }
+.empty { color: #bbb; font-size: 0.9rem; padding: 12px 0; }
+.income { color: #10b981; }
+.expense { color: #ef4444; }
+.muted { color: #999; }
+</style>
+
+<env>
+APP_NAME=ahtml-finance
+</env>

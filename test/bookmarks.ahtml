@@ -1,0 +1,665 @@
+<db type="sqlite">
+CREATE TABLE IF NOT EXISTS bookmarks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  url TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT '',
+  favicon TEXT NOT NULL DEFAULT '',
+  read INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+</db>
+
+<server lang="python">
+import re
+import urllib.request
+import urllib.error
+from html.parser import HTMLParser
+
+class MetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.title = ''
+        self.description = ''
+        self.favicon = ''
+        self._in_title = False
+        self._head_done = False
+
+    def handle_starttag(self, tag, attrs):
+        if self._head_done:
+            return
+        attrs_dict = dict(attrs)
+        if tag == 'title':
+            self._in_title = True
+        elif tag == 'meta':
+            name = attrs_dict.get('name', '').lower()
+            prop = attrs_dict.get('property', '').lower()
+            content = attrs_dict.get('content', '')
+            if name in ('description',) and not self.description:
+                self.description = content
+            elif prop in ('og:description',) and not self.description:
+                self.description = content
+            elif prop in ('og:title',) and not self.title:
+                self.title = content
+        elif tag == 'link':
+            rel = attrs_dict.get('rel', '').lower()
+            href = attrs_dict.get('href', '')
+            if 'icon' in rel and href and not self.favicon:
+                self.favicon = href
+        elif tag == 'body':
+            self._head_done = True
+
+    def handle_endtag(self, tag):
+        if tag == 'title':
+            self._in_title = False
+        if tag == 'head':
+            self._head_done = True
+
+    def handle_data(self, data):
+        if self._in_title and not self.title:
+            self.title = data.strip()
+
+
+def fetch_meta(url):
+    if not url.startswith('http://') and not url.startswith('https://'):
+        url = 'https://' + url
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; bookmarks-ahtml/1.0)',
+                'Accept': 'text/html,application/xhtml+xml',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            content_type = resp.headers.get('Content-Type', '')
+            if 'text/html' not in content_type and 'application/xhtml' not in content_type:
+                return url, '', '', ''
+            raw = resp.read(65536)
+            charset = 'utf-8'
+            m = re.search(r'charset=["\']?([\w-]+)', content_type)
+            if m:
+                charset = m.group(1)
+            html = raw.decode(charset, errors='replace')
+            final_url = resp.geturl()
+    except Exception as e:
+        return url, '', '', ''
+
+    parser = MetaParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+
+    title = parser.title.strip()[:255]
+    description = parser.description.strip()[:500]
+    favicon = parser.favicon
+
+    # Resolve relative favicon URLs
+    if favicon and not favicon.startswith('http'):
+        from urllib.parse import urlparse, urljoin
+        favicon = urljoin(final_url, favicon)
+
+    # Fallback favicon via Google
+    if not favicon:
+        from urllib.parse import urlparse
+        parsed = urlparse(final_url)
+        favicon = f'https://www.google.com/s2/favicons?domain={parsed.netloc}&sz=32'
+
+    return final_url, title, description, favicon
+
+
+@app.post('/api/fetch-meta')
+def post_fetch_meta(req, res):
+    url = (req.body or {}).get('url', '').strip()
+    if not url:
+        res.status(400).json({'error': 'url required'})
+        return
+    final_url, title, description, favicon = fetch_meta(url)
+    res.json({'url': final_url, 'title': title, 'description': description, 'favicon': favicon})
+
+
+@app.get('/api/bookmarks')
+def get_bookmarks(req, res):
+    tag = (req.query or {}).get('tag', '').strip()
+    read = (req.query or {}).get('read', '').strip()
+    search = (req.query or {}).get('search', '').strip()
+
+    conditions = []
+    params = []
+
+    if tag:
+        conditions.append("(',' || COALESCE(tags,'') || ',' LIKE ?)")
+        params.append(f'%,{tag},%')
+    if read in ('0', '1'):
+        conditions.append('read = ?')
+        params.append(int(read))
+    if search:
+        conditions.append('(title LIKE ? OR description LIKE ? OR url LIKE ?)')
+        params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
+
+    where = ('WHERE ' + ' AND '.join(conditions)) if conditions else ''
+    rows = db.query(f'SELECT * FROM bookmarks {where} ORDER BY created_at DESC', params)
+    res.json(rows)
+
+
+@app.post('/api/bookmarks')
+def post_bookmark(req, res):
+    body = req.body or {}
+    url = body.get('url', '').strip()
+    title = body.get('title', '').strip()
+    description = body.get('description', '').strip()
+    tags = body.get('tags', '').strip()
+    favicon = body.get('favicon', '').strip()
+
+    if not url:
+        res.status(400).json({'error': 'url required'})
+        return
+
+    existing = db.get('SELECT id FROM bookmarks WHERE url = ?', [url])
+    if existing:
+        res.status(409).json({'error': 'bookmark already exists', 'id': existing['id']})
+        return
+
+    result = db.run(
+        'INSERT INTO bookmarks (url, title, description, tags, favicon) VALUES (?, ?, ?, ?, ?)',
+        [url, title, description, tags, favicon]
+    )
+    row = db.get('SELECT * FROM bookmarks WHERE id = ?', [result['lastInsertRowid']])
+    res.json(row)
+
+
+@app.put('/api/bookmarks/:id')
+def put_bookmark(req, res):
+    bm_id = req.params.get('id', '')
+    body = req.body or {}
+    title = body.get('title', '').strip()
+    description = body.get('description', '').strip()
+    tags = body.get('tags', '').strip()
+    read = int(body.get('read', 0))
+
+    db.run(
+        'UPDATE bookmarks SET title = ?, description = ?, tags = ?, read = ? WHERE id = ?',
+        [title, description, tags, read, bm_id]
+    )
+    row = db.get('SELECT * FROM bookmarks WHERE id = ?', [bm_id])
+    if not row:
+        res.status(404).json({'error': 'not found'})
+        return
+    res.json(row)
+
+
+@app.delete('/api/bookmarks/:id')
+def delete_bookmark(req, res):
+    bm_id = req.params.get('id', '')
+    db.run('DELETE FROM bookmarks WHERE id = ?', [bm_id])
+    res.json({'ok': True})
+
+
+@app.post('/api/bookmarks/:id/toggle-read')
+def toggle_read(req, res):
+    bm_id = req.params.get('id', '')
+    row = db.get('SELECT read FROM bookmarks WHERE id = ?', [bm_id])
+    if not row:
+        res.status(404).json({'error': 'not found'})
+        return
+    new_read = 0 if row['read'] else 1
+    db.run('UPDATE bookmarks SET read = ? WHERE id = ?', [new_read, bm_id])
+    res.json({'read': new_read})
+</server>
+
+<client>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Marks</title>
+</head>
+<body>
+  <header>
+    <a href="/" class="logo" onclick="navigate('/');return false;">✦ Marks</a>
+    <div class="header-actions">
+      <div class="search-wrap">
+        <input type="text" id="search-input" placeholder="Search bookmarks…" oninput="onSearch(this.value)" />
+      </div>
+      <button class="btn" onclick="openAddModal()">+ Add</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="sidebar-layout">
+      <aside id="sidebar">
+        <div class="filter-group">
+          <div class="filter-label">Status</div>
+          <button class="filter-btn active" data-filter="all" onclick="setFilter('all', this)">All</button>
+          <button class="filter-btn" data-filter="unread" onclick="setFilter('unread', this)">Unread</button>
+          <button class="filter-btn" data-filter="read" onclick="setFilter('read', this)">Read</button>
+        </div>
+        <div class="filter-group" id="tag-sidebar">
+          <div class="filter-label">Tags</div>
+          <div id="tag-list"></div>
+        </div>
+      </aside>
+      <section id="bookmark-list"></section>
+    </div>
+  </main>
+
+  <!-- Add Modal -->
+  <div class="modal-backdrop" id="add-modal" onclick="closeAddModal(event)">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">Add Bookmark</span>
+        <button class="modal-close" onclick="closeAddModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="url-row">
+          <input type="url" id="add-url" placeholder="https://…" onkeydown="if(event.key==='Enter')fetchMeta()" />
+          <button class="btn" id="fetch-btn" onclick="fetchMeta()">Fetch</button>
+        </div>
+        <div id="meta-preview" class="meta-preview hidden">
+          <img id="preview-favicon" class="preview-favicon" src="" alt="" />
+          <div class="preview-info">
+            <input type="text" id="add-title" placeholder="Title" />
+            <textarea id="add-desc" rows="2" placeholder="Description"></textarea>
+          </div>
+        </div>
+        <input type="text" id="add-tags" placeholder="Tags (comma-separated)" />
+        <div id="add-error" class="form-error hidden"></div>
+        <div class="modal-actions">
+          <button class="btn-ghost" onclick="closeAddModal()">Cancel</button>
+          <button class="btn" id="save-btn" onclick="saveBookmark()" disabled>Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit Modal -->
+  <div class="modal-backdrop" id="edit-modal" onclick="closeEditModal(event)">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">Edit Bookmark</span>
+        <button class="modal-close" onclick="closeEditModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="edit-id" />
+        <input type="text" id="edit-title" placeholder="Title" />
+        <textarea id="edit-desc" rows="2" placeholder="Description"></textarea>
+        <input type="text" id="edit-tags" placeholder="Tags (comma-separated)" />
+        <div class="modal-actions">
+          <button class="btn-ghost" onclick="closeEditModal()">Cancel</button>
+          <button class="btn" onclick="updateBookmark()">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function esc(str) {
+      return String(str || '')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function api(method, path, body) {
+      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+      if (body) opts.body = JSON.stringify(body);
+      const res = await fetch(path, opts);
+      return res.json();
+    }
+
+    let allBookmarks = [];
+    let activeFilter = 'all';
+    let activeTag = '';
+    let searchQuery = '';
+    let fetchedMeta = null;
+
+    // ── Data ─────────────────────────────────────────────────────────────────
+    async function loadBookmarks() {
+      allBookmarks = await api('GET', '/api/bookmarks');
+      renderAll();
+    }
+
+    // ── Filters ───────────────────────────────────────────────────────────────
+    function setFilter(filter, el) {
+      activeFilter = filter;
+      activeTag = '';
+      document.querySelectorAll('.filter-btn[data-filter]').forEach(b => b.classList.remove('active'));
+      el.classList.add('active');
+      document.querySelectorAll('.tag-btn').forEach(b => b.classList.remove('active'));
+      renderList();
+    }
+
+    function setTag(tag) {
+      activeTag = activeTag === tag ? '' : tag;
+      document.querySelectorAll('.tag-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.tag === activeTag);
+      });
+      renderList();
+    }
+
+    function onSearch(val) {
+      searchQuery = val.trim().toLowerCase();
+      renderList();
+    }
+
+    function getFiltered() {
+      return allBookmarks.filter(bm => {
+        if (activeFilter === 'read' && !bm.read) return false;
+        if (activeFilter === 'unread' && bm.read) return false;
+        if (activeTag) {
+          const tags = (bm.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+          if (!tags.includes(activeTag)) return false;
+        }
+        if (searchQuery) {
+          const haystack = `${bm.title} ${bm.description} ${bm.url}`.toLowerCase();
+          if (!haystack.includes(searchQuery)) return false;
+        }
+        return true;
+      });
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────────
+    function renderAll() {
+      renderTags();
+      renderList();
+    }
+
+    function renderTags() {
+      const tagCounts = {};
+      allBookmarks.forEach(bm => {
+        (bm.tags || '').split(',').map(t => t.trim()).filter(Boolean).forEach(t => {
+          tagCounts[t] = (tagCounts[t] || 0) + 1;
+        });
+      });
+      const tagList = document.getElementById('tag-list');
+      if (Object.keys(tagCounts).length === 0) {
+        tagList.innerHTML = '<span class="no-tags">No tags yet</span>';
+        return;
+      }
+      tagList.innerHTML = Object.entries(tagCounts)
+        .sort((a, b) => b[1] - a[1])
+        .map(([tag, count]) => `
+          <button class="tag-btn${activeTag === tag ? ' active' : ''}" data-tag="${esc(tag)}" onclick="setTag('${esc(tag)}')">
+            ${esc(tag)} <span class="tag-count">${count}</span>
+          </button>
+        `).join('');
+    }
+
+    function renderList() {
+      const filtered = getFiltered();
+      const container = document.getElementById('bookmark-list');
+      if (filtered.length === 0) {
+        container.innerHTML = `<div class="empty">${allBookmarks.length === 0 ? 'No bookmarks yet. Add one!' : 'No results.'}</div>`;
+        return;
+      }
+      container.innerHTML = filtered.map(bm => {
+        const tags = (bm.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+        const domain = (() => { try { return new URL(bm.url).hostname.replace('www.', ''); } catch { return bm.url; } })();
+        return `
+          <div class="bookmark-card${bm.read ? ' is-read' : ''}" data-id="${bm.id}">
+            <div class="bookmark-left">
+              <img class="favicon" src="${esc(bm.favicon)}" alt="" onerror="this.style.display='none'" />
+            </div>
+            <div class="bookmark-body">
+              <div class="bookmark-title-row">
+                <a class="bookmark-title" href="${esc(bm.url)}" target="_blank" rel="noopener">${esc(bm.title || bm.url)}</a>
+                ${bm.read ? '<span class="read-badge">Read</span>' : ''}
+              </div>
+              <div class="bookmark-domain">${esc(domain)}</div>
+              ${bm.description ? `<div class="bookmark-desc">${esc(bm.description)}</div>` : ''}
+              ${tags.length ? `<div class="bookmark-tags">${tags.map(t => `<span class="tag" onclick="setTag('${esc(t)}')">${esc(t)}</span>`).join('')}</div>` : ''}
+            </div>
+            <div class="bookmark-actions">
+              <button class="action-btn" title="${bm.read ? 'Mark unread' : 'Mark read'}" onclick="toggleRead(${bm.id})">${bm.read ? '↩' : '✓'}</button>
+              <button class="action-btn" title="Edit" onclick="openEditModal(${bm.id})">✎</button>
+              <button class="action-btn action-btn--danger" title="Delete" onclick="deleteBookmark(${bm.id})">✕</button>
+            </div>
+          </div>`;
+      }).join('');
+    }
+
+    // ── Add Modal ─────────────────────────────────────────────────────────────
+    function openAddModal() {
+      fetchedMeta = null;
+      document.getElementById('add-url').value = '';
+      document.getElementById('add-title').value = '';
+      document.getElementById('add-desc').value = '';
+      document.getElementById('add-tags').value = '';
+      document.getElementById('add-error').classList.add('hidden');
+      document.getElementById('meta-preview').classList.add('hidden');
+      document.getElementById('save-btn').disabled = true;
+      document.getElementById('add-modal').classList.add('open');
+      setTimeout(() => document.getElementById('add-url').focus(), 50);
+    }
+
+    function closeAddModal(e) {
+      if (e && e.target !== document.getElementById('add-modal')) return;
+      document.getElementById('add-modal').classList.remove('open');
+    }
+
+    async function fetchMeta() {
+      const url = document.getElementById('add-url').value.trim();
+      if (!url) return;
+      const btn = document.getElementById('fetch-btn');
+      const errEl = document.getElementById('add-error');
+      errEl.classList.add('hidden');
+      btn.disabled = true;
+      btn.textContent = '…';
+
+      try {
+        const data = await api('POST', '/api/fetch-meta', { url });
+        if (data.error) throw new Error(data.error);
+        fetchedMeta = data;
+        document.getElementById('add-title').value = data.title || '';
+        document.getElementById('add-desc').value = data.description || '';
+        if (data.favicon) {
+          document.getElementById('preview-favicon').src = data.favicon;
+        }
+        document.getElementById('add-url').value = data.url;
+        document.getElementById('meta-preview').classList.remove('hidden');
+        document.getElementById('save-btn').disabled = false;
+      } catch (err) {
+        errEl.textContent = 'Could not fetch page — you can still save manually.';
+        errEl.classList.remove('hidden');
+        document.getElementById('meta-preview').classList.remove('hidden');
+        document.getElementById('save-btn').disabled = false;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Fetch';
+      }
+    }
+
+    async function saveBookmark() {
+      const url = document.getElementById('add-url').value.trim();
+      const title = document.getElementById('add-title').value.trim();
+      const description = document.getElementById('add-desc').value.trim();
+      const tags = document.getElementById('add-tags').value.trim();
+      const favicon = fetchedMeta ? fetchedMeta.favicon : '';
+      const errEl = document.getElementById('add-error');
+
+      if (!url) { errEl.textContent = 'URL is required'; errEl.classList.remove('hidden'); return; }
+      errEl.classList.add('hidden');
+
+      const data = await api('POST', '/api/bookmarks', { url, title, description, tags, favicon });
+      if (data.error) {
+        if (data.error.includes('already exists')) {
+          errEl.textContent = 'This URL is already bookmarked.';
+          errEl.classList.remove('hidden');
+        } else {
+          errEl.textContent = data.error;
+          errEl.classList.remove('hidden');
+        }
+        return;
+      }
+      allBookmarks.unshift(data);
+      renderAll();
+      document.getElementById('add-modal').classList.remove('open');
+    }
+
+    // ── Edit Modal ────────────────────────────────────────────────────────────
+    function openEditModal(id) {
+      const bm = allBookmarks.find(b => b.id === id);
+      if (!bm) return;
+      document.getElementById('edit-id').value = id;
+      document.getElementById('edit-title').value = bm.title || '';
+      document.getElementById('edit-desc').value = bm.description || '';
+      document.getElementById('edit-tags').value = bm.tags || '';
+      document.getElementById('edit-modal').classList.add('open');
+      setTimeout(() => document.getElementById('edit-title').focus(), 50);
+    }
+
+    function closeEditModal(e) {
+      if (e && e.target !== document.getElementById('edit-modal')) return;
+      document.getElementById('edit-modal').classList.remove('open');
+    }
+
+    async function updateBookmark() {
+      const id = document.getElementById('edit-id').value;
+      const title = document.getElementById('edit-title').value.trim();
+      const description = document.getElementById('edit-desc').value.trim();
+      const tags = document.getElementById('edit-tags').value.trim();
+      const bm = allBookmarks.find(b => b.id == id);
+      const read = bm ? bm.read : 0;
+
+      const data = await api('PUT', `/api/bookmarks/${id}`, { title, description, tags, read });
+      if (!data.error) {
+        const idx = allBookmarks.findIndex(b => b.id == id);
+        if (idx >= 0) allBookmarks[idx] = data;
+        renderAll();
+      }
+      document.getElementById('edit-modal').classList.remove('open');
+    }
+
+    // ── Actions ───────────────────────────────────────────────────────────────
+    async function toggleRead(id) {
+      const data = await api('POST', `/api/bookmarks/${id}/toggle-read`, {});
+      const bm = allBookmarks.find(b => b.id === id);
+      if (bm) bm.read = data.read;
+      renderAll();
+    }
+
+    async function deleteBookmark(id) {
+      if (!confirm('Delete this bookmark?')) return;
+      await api('DELETE', `/api/bookmarks/${id}`, {});
+      allBookmarks = allBookmarks.filter(b => b.id !== id);
+      renderAll();
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    document.addEventListener('DOMContentLoaded', loadBookmarks);
+  </script>
+</body>
+</html>
+</client>
+
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, 'Inter', sans-serif; background: #faf9f6; color: #1a1a1a; min-height: 100vh; }
+a { color: inherit; text-decoration: none; }
+
+header {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 12px 28px; background: rgba(250,249,246,0.92);
+  backdrop-filter: blur(8px); border-bottom: 1px solid #eee;
+}
+.logo { font-weight: 700; font-size: 1rem; color: #1a1a1a; cursor: pointer; }
+.header-actions { display: flex; align-items: center; gap: 10px; flex: 1; justify-content: flex-end; max-width: 640px; }
+.search-wrap { flex: 1; max-width: 320px; }
+.search-wrap input { padding: 8px 14px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.88rem; width: 100%; outline: none; background: white; }
+.search-wrap input:focus { border-color: #0f6e56; }
+
+main { padding: 28px; max-width: 1100px; margin: 0 auto; }
+
+.sidebar-layout { display: grid; grid-template-columns: 180px 1fr; gap: 28px; align-items: start; }
+
+/* Sidebar */
+aside { position: sticky; top: 72px; }
+.filter-group { margin-bottom: 20px; }
+.filter-label { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #999; margin-bottom: 6px; }
+.filter-btn { display: block; width: 100%; text-align: left; padding: 7px 10px; border: none; border-radius: 7px; font-size: 0.88rem; color: #555; background: none; cursor: pointer; transition: background 0.12s; }
+.filter-btn:hover { background: #f0ede8; color: #1a1a1a; }
+.filter-btn.active { background: #e8f0ed; color: #0f6e56; font-weight: 600; }
+.tag-btn { display: flex; align-items: center; justify-content: space-between; width: 100%; text-align: left; padding: 6px 10px; border: none; border-radius: 7px; font-size: 0.85rem; color: #555; background: none; cursor: pointer; }
+.tag-btn:hover { background: #f0ede8; color: #1a1a1a; }
+.tag-btn.active { background: #e8f0ed; color: #0f6e56; font-weight: 600; }
+.tag-count { font-size: 0.75rem; background: #eee; color: #888; border-radius: 10px; padding: 1px 6px; }
+.no-tags { font-size: 0.82rem; color: #bbb; padding: 4px 10px; display: block; }
+
+/* Bookmark list */
+#bookmark-list { display: flex; flex-direction: column; gap: 10px; }
+.empty { padding: 48px; text-align: center; color: #bbb; font-size: 0.95rem; }
+
+.bookmark-card {
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 14px 16px; background: white; border: 1.5px solid #eee;
+  border-radius: 12px; transition: border-color 0.12s;
+}
+.bookmark-card:hover { border-color: #ddd; }
+.bookmark-card.is-read { opacity: 0.6; }
+
+.bookmark-left { flex-shrink: 0; padding-top: 2px; }
+.favicon { width: 20px; height: 20px; border-radius: 4px; object-fit: contain; }
+
+.bookmark-body { flex: 1; min-width: 0; }
+.bookmark-title-row { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+.bookmark-title { font-size: 0.95rem; font-weight: 600; color: #1a1a1a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bookmark-title:hover { color: #0f6e56; }
+.bookmark-domain { font-size: 0.78rem; color: #aaa; margin-bottom: 4px; }
+.bookmark-desc { font-size: 0.85rem; color: #666; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 6px; }
+.bookmark-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.tag { font-size: 0.75rem; background: #f0ede8; color: #666; border-radius: 5px; padding: 2px 8px; cursor: pointer; }
+.tag:hover { background: #e8f0ed; color: #0f6e56; }
+.read-badge { font-size: 0.7rem; background: #e8f0ed; color: #0f6e56; border-radius: 4px; padding: 2px 7px; font-weight: 600; white-space: nowrap; }
+
+.bookmark-actions { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; opacity: 0; transition: opacity 0.12s; }
+.bookmark-card:hover .bookmark-actions { opacity: 1; }
+.action-btn { background: none; border: 1.5px solid #eee; border-radius: 6px; padding: 4px 8px; font-size: 0.82rem; cursor: pointer; color: #888; transition: all 0.1s; }
+.action-btn:hover { border-color: #0f6e56; color: #0f6e56; }
+.action-btn--danger:hover { border-color: #dc2626; color: #dc2626; }
+
+/* Modals */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 500;
+  background: rgba(0,0,0,0.25); backdrop-filter: blur(3px);
+  display: none; align-items: center; justify-content: center;
+}
+.modal-backdrop.open { display: flex; }
+.modal { background: white; border-radius: 14px; width: 100%; max-width: 500px; margin: 0 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.12); }
+.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px 0; }
+.modal-title { font-weight: 700; font-size: 1rem; }
+.modal-close { background: none; border: none; font-size: 1.3rem; color: #bbb; cursor: pointer; line-height: 1; padding: 0 2px; }
+.modal-close:hover { color: #555; }
+.modal-body { padding: 16px 20px 20px; display: flex; flex-direction: column; gap: 10px; }
+.url-row { display: flex; gap: 8px; }
+.url-row input { flex: 1; }
+
+.meta-preview { display: flex; gap: 12px; align-items: flex-start; padding: 12px; background: #faf9f6; border-radius: 10px; border: 1.5px solid #eee; }
+.meta-preview.hidden { display: none; }
+.preview-favicon { width: 32px; height: 32px; border-radius: 6px; object-fit: contain; flex-shrink: 0; margin-top: 4px; }
+.preview-info { flex: 1; display: flex; flex-direction: column; gap: 7px; }
+
+input, textarea {
+  width: 100%; padding: 9px 12px; border: 1.5px solid #ddd; border-radius: 8px;
+  font-size: 0.9rem; font-family: inherit; outline: none; background: white; resize: vertical;
+}
+input:focus, textarea:focus { border-color: #0f6e56; }
+.form-error { font-size: 0.82rem; color: #dc2626; }
+.form-error.hidden { display: none; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 4px; }
+
+.btn { display: inline-block; padding: 9px 18px; background: #0f6e56; color: white; border: none; border-radius: 8px; font-size: 0.9rem; cursor: pointer; font-family: inherit; }
+.btn:hover:not(:disabled) { background: #085041; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-ghost { display: inline-block; padding: 8px 16px; border: 1.5px solid #ddd; border-radius: 8px; font-size: 0.9rem; color: #666; background: white; cursor: pointer; font-family: inherit; }
+.btn-ghost:hover { border-color: #aaa; }
+
+@media (max-width: 640px) {
+  .sidebar-layout { grid-template-columns: 1fr; }
+  aside { position: static; display: flex; gap: 16px; flex-wrap: wrap; }
+  .filter-group { margin-bottom: 0; }
+}
+</style>

@@ -24,9 +24,11 @@ if (flags.has('--help') || flags.has('-h') || args.length === 0) {
     ahtml --help                 show this help
 
   Blocks:
-    <server lang="node">   Node.js backend (required)
+    <server lang="node">   Node.js backend (required, default)
+    <server lang="python"> Python 3 backend (Flask-style routes, stdlib sqlite3)
     <client>               HTML frontend (required)
     <db type="sqlite">     SQLite schema, auto-provisioned
+    <deps>                 pip packages for python servers, one per line
     <style>                CSS injected into client
     <env>                  KEY=value pairs → process.env
 `)

@@ -1,6 +1,7 @@
 'use strict'
 
 const http = require('http')
+const net = require('net')
 const fs = require('fs')
 const path = require('path')
 const { execSync, spawn } = require('child_process')
@@ -10,6 +11,7 @@ const { parse, validate } = require('./parser')
 const { findFreePort } = require('./ports')
 const { prepareClient } = require('./client')
 const { createDb } = require('./db')
+const { buildPythonServerFile, findPython, setupVenv } = require('./python')
 
 // We run the user's <server> block as a temp file so it has full Node access.
 // We inject a tiny shim at the top that wires up the raw http server to handle
@@ -30,14 +32,18 @@ const app = {
 // db is injected below if a <db> block exists
 let db = null;
 
+// io is injected below if an <io> block exists
+let io = null;
+
 // Simple res helpers (Express-compatible surface)
 function buildRes(res) {
+  let _status = 200;
   return {
-    json(data)         { res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify(data)); },
-    send(text)         { res.writeHead(200, {'Content-Type':'text/plain'});       res.end(String(text)); },
-    html(text)         { res.writeHead(200, {'Content-Type':'text/html'});        res.end(String(text)); },
-    status(code)       { res.statusCode = code; return this; },
-    set(k, v)          { res.setHeader(k, v); return this; },
+    json(data)   { res.writeHead(_status, {'Content-Type':'application/json'}); res.end(JSON.stringify(data)); },
+    send(text)   { res.writeHead(_status, {'Content-Type':'text/plain'});       res.end(String(text)); },
+    html(text)   { res.writeHead(_status, {'Content-Type':'text/html'});        res.end(String(text)); },
+    status(code) { _status = code; return this; },
+    set(k, v)    { res.setHeader(k, v); return this; },
   };
 }
 
@@ -57,13 +63,20 @@ function buildReq(req, body) {
 // ---- USER SERVER CODE ----
 `
 
-const SERVER_SHIM_FOOTER = `
+function makeServerShimFooter(ioCode, socketIoPath) {
+  const ioSetup = ioCode ? `
+  const { Server: __IOServer } = require(${JSON.stringify(socketIoPath)});
+  io = new __IOServer(__httpServer, { cors: { origin: '*' } });
+  ${ioCode}
+` : ''
+
+  return `
 // ---- END USER CODE ----
 
 const __port = parseInt(process.env.__AHTML_API_PORT, 10);
 
 function __startServer() {
-  http.createServer((req, res) => {
+  const __httpServer = http.createServer((req, res) => {
     let body = '';
     req.on('data', c => body += c);
     req.on('end', () => {
@@ -83,7 +96,9 @@ function __startServer() {
       res.writeHead(404, {'Content-Type':'application/json'});
       res.end(JSON.stringify({ error: 'not found', path: request.path }));
     });
-  }).listen(__port, () => {
+  });
+  ${ioSetup}
+  __httpServer.listen(__port, () => {
     process.send && process.send({ ready: true, port: __port });
   });
 }
@@ -138,6 +153,7 @@ if (process.env.__AHTML_DB_PATH) {
   __startServer();
 }
 `
+}
 
 async function run(ahtmlPath, options = {}) {
   const { watch = true, open: openBrowser = true } = options
@@ -166,27 +182,18 @@ async function run(ahtmlPath, options = {}) {
   let reloadToken = Date.now().toString()
   let apiProcess = null
 
-  function startApiServer(serverCode) {
-    const tmpFile = path.join(os.tmpdir(), `ahtml-server-${Date.now()}.js`)
-    const full = SERVER_SHIM + serverCode + SERVER_SHIM_FOOTER
-    fs.writeFileSync(tmpFile, full)
-
-    // Build db env vars if a <db> block exists
+  function dbEnvVars() {
     const dbEnv = {}
     if (parsed.db) {
       const dbFilename = parsed.meta.dbFile || path.basename(absPath, '.ahtml') + '.db'
       const dbPath = path.resolve(path.dirname(absPath), dbFilename)
-      const sqlJsPath = require.resolve('sql.js')
       dbEnv.__AHTML_DB_PATH = dbPath
-      dbEnv.__AHTML_SQLJS_PATH = sqlJsPath
       dbEnv.__AHTML_DB_SCHEMA = Buffer.from(parsed.db).toString('base64')
     }
+    return dbEnv
+  }
 
-    const child = spawn(process.execPath, [tmpFile], {
-      env: { ...process.env, __AHTML_API_PORT: String(apiPort), ...dbEnv },
-      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    })
-
+  function wireChild(child, tmpFile) {
     child.stdout.on('data', d => process.stdout.write(`[server] ${d}`))
     child.stderr.on('data', d => process.stderr.write(`[server] ${d}`))
     child.on('exit', (code) => {
@@ -195,19 +202,75 @@ async function run(ahtmlPath, options = {}) {
       }
       try { fs.unlinkSync(tmpFile) } catch (_) {}
     })
-
     return child
   }
 
-  function restartApiServer(serverCode) {
+  function startPythonServer(serverCode) {
+    const basePython = findPython()
+    if (!basePython) {
+      console.error('[ahtml] Python 3 not found on PATH — install Python 3 to run a <server lang="python"> block')
+      process.exit(1)
+    }
+
+    let pythonExe = basePython
+    if (parsed.deps && parsed.deps.length) {
+      try {
+        pythonExe = setupVenv(parsed.deps, absPath, basePython)
+      } catch (e) {
+        console.error(`[ahtml] failed to install python deps: ${e.message}`)
+        process.exit(1)
+      }
+    }
+
+    const tmpFile = path.join(os.tmpdir(), `ahtml-server-${Date.now()}.py`)
+    fs.writeFileSync(tmpFile, buildPythonServerFile(serverCode))
+
+    const child = spawn(pythonExe, [tmpFile], {
+      env: { ...process.env, __AHTML_API_PORT: String(apiPort), ...dbEnvVars() },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    return wireChild(child, tmpFile)
+  }
+
+  function startApiServer(serverCode, ioCode) {
+    if (parsed.meta.serverLang === 'python') {
+      return startPythonServer(serverCode)
+    }
+
+    const tmpFile = path.join(os.tmpdir(), `ahtml-server-${Date.now()}.js`)
+
+    // Resolve socket.io path from parent process so child can require it
+    let socketIoPath = null
+    if (ioCode) {
+      socketIoPath = require.resolve('socket.io')
+    }
+
+    const footer = makeServerShimFooter(ioCode, socketIoPath)
+    const full = SERVER_SHIM + serverCode + footer
+    fs.writeFileSync(tmpFile, full)
+
+    // Node uses sql.js for the db; resolve its path so the child can require it.
+    const dbEnv = dbEnvVars()
+    if (parsed.db) dbEnv.__AHTML_SQLJS_PATH = require.resolve('sql.js')
+
+    const child = spawn(process.execPath, [tmpFile], {
+      env: { ...process.env, __AHTML_API_PORT: String(apiPort), ...dbEnv },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    })
+
+    return wireChild(child, tmpFile)
+  }
+
+  function restartApiServer(serverCode, ioCode) {
     if (apiProcess) {
       apiProcess.kill()
       apiProcess = null
     }
-    apiProcess = startApiServer(serverCode)
+    apiProcess = startApiServer(serverCode, ioCode)
   }
 
-  restartApiServer(parsed.server)
+  restartApiServer(parsed.server, parsed.io)
 
   // Client HTTP server — serves HTML and proxies /api/* to the API server
   const clientServer = http.createServer((req, res) => {
@@ -218,8 +281,9 @@ async function run(ahtmlPath, options = {}) {
       return
     }
 
-    // Proxy everything except / to the API server
-    if (req.url !== '/' && req.url !== '/index.html') {
+    // Proxy /api/* to the API server
+    const reqPath = req.url.split('?')[0]
+    if (reqPath.startsWith('/api/') || reqPath === '/api') {
       const proxyReq = http.request({
         host: '127.0.0.1',
         port: apiPort,
@@ -238,7 +302,7 @@ async function run(ahtmlPath, options = {}) {
       return
     }
 
-    // Serve client HTML
+    // Serve client HTML for all other paths (SPA routing)
     const html = prepareClient(parsed.client, {
       style: parsed.style,
       port: clientPort,
@@ -246,6 +310,22 @@ async function run(ahtmlPath, options = {}) {
     })
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(html)
+  })
+
+  // Proxy WebSocket upgrades (used by socket.io) to the API server
+  clientServer.on('upgrade', (req, socket, head) => {
+    const proxySocket = net.connect(apiPort, '127.0.0.1')
+    proxySocket.on('connect', () => {
+      const headers = Object.entries(req.headers)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\r\n')
+      proxySocket.write(`${req.method} ${req.url} HTTP/1.1\r\n${headers}\r\n\r\n`)
+      if (head && head.length) proxySocket.write(head)
+      socket.pipe(proxySocket)
+      proxySocket.pipe(socket)
+    })
+    proxySocket.on('error', () => socket.destroy())
+    socket.on('error', () => proxySocket.destroy())
   })
 
   clientServer.listen(clientPort, '127.0.0.1', () => {
@@ -279,7 +359,7 @@ async function run(ahtmlPath, options = {}) {
         }
         parsed = newParsed
         reloadToken = Date.now().toString()
-        restartApiServer(parsed.server)
+        restartApiServer(parsed.server, parsed.io)
         console.log('[ahtml] reloaded')
       } catch (e) {
         console.error('[ahtml] reload error:', e.message)
